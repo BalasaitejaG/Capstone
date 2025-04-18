@@ -19,12 +19,30 @@ from src.processing.data_preprocessing import DataPreprocessor, ReviewClassifier
 from src.kafka.consumer import AdvancedReviewConsumer
 from src.utils.logger import setup_logger
 
-logger = setup_logger(__name__)
 
-# Create necessary directories
-os.makedirs('models', exist_ok=True)
-os.makedirs('results', exist_ok=True)
-os.makedirs('Data/Testing_data', exist_ok=True)
+def create_required_directories():
+    """Create all directories required by the application"""
+    # Create main directories
+    os.makedirs('models', exist_ok=True)
+
+    # Create results directories
+    os.makedirs('results', exist_ok=True)
+    os.makedirs('results/training', exist_ok=True)
+    os.makedirs('results/testing', exist_ok=True)
+
+    # Create data directories
+    os.makedirs('Data/Testing_data', exist_ok=True)
+    os.makedirs('Data/Training_data', exist_ok=True)
+    os.makedirs('Data/Scraped_data', exist_ok=True)
+
+    print("All required directories have been created.")
+
+
+# Create all required directories
+create_required_directories()
+
+# Initialize logger
+logger = setup_logger(__name__)
 
 # Cache for test data
 _test_data_cache = {}
@@ -49,6 +67,10 @@ def run_amazon_scraper(convert_only=False):
             logger.info("Converting JSON to CSV only...")
             json_file = 'Data/Scraped_data/Json_file/all_reviews.json'
             csv_file = 'Data/Scraped_data/Test_data.csv'
+
+            # Create Json_file directory if it doesn't exist
+            os.makedirs(os.path.dirname(json_file), exist_ok=True)
+
             num_reviews = scraper.convert_json_to_csv(json_file, csv_file)
             logger.info(
                 f"Conversion complete. {num_reviews} reviews saved to CSV.")
