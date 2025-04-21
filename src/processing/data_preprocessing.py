@@ -33,14 +33,14 @@ logger = setup_logger(__name__)
 
 
 class DataPreprocessor:
-    def __init__(self, max_features=3000):  # Reduced from 5000 to 3000
+    def __init__(self, max_features=1000):  # Reduced from 3000 to 1000
         self.max_features = max_features
-        # Update vectorizer settings
+        # Update vectorizer settings with more conservative parameters
         self.vectorizer = TfidfVectorizer(
             max_features=max_features,
-            ngram_range=(1, 2),  # Reduced from (1,3) to (1,2)
-            min_df=3,  # Increased from 2 to filter more noise
-            max_df=0.9,  # Adjusted from 0.95
+            ngram_range=(1, 2),  # Keep (1,2) for basic bi-grams
+            min_df=5,  # Increased from 3 to filter more noise
+            max_df=0.8,  # Decreased from 0.9 to remove more common words
             strip_accents='unicode',
             analyzer='word',
             token_pattern=r'\w{1,}',
@@ -488,56 +488,89 @@ class DataPreprocessor:
             f"Class distribution after augmentation: {result_df['label'].value_counts().to_dict()}")
         return result_df
 
-    def preprocess_combined_data(self, combined_path):
-        """Process a combined dataset that already has labeled and unlabeled data together"""
+    def preprocess_dataset(self, dataset_path):
+        """Process a dataset that already has labeled and unlabeled data together"""
         try:
             self.start_time = time.time()
-            logger.info("Loading and preprocessing combined dataset")
+            logger.info("Loading and preprocessing dataset")
 
-            # Load combined dataset
+            # Load dataset with latin1 encoding
             try:
-                combined_df = pd.read_csv(combined_path)
-                logger.info(f"Combined data size: {len(combined_df)}")
+                dataset_df = pd.read_csv(dataset_path, encoding='latin1')
+                logger.info(f"Dataset size: {len(dataset_df)}")
 
                 # Validate required columns
-                if 'review_text' not in combined_df.columns:
-                    if 'review' in combined_df.columns:
-                        combined_df['review_text'] = combined_df['review']
+                if 'review_text' not in dataset_df.columns:
+                    if 'review' in dataset_df.columns:
+                        dataset_df['review_text'] = dataset_df['review']
+                        logger.info("Using 'review' column as 'review_text'")
                     else:
                         raise ValueError(
-                            f"Missing required column 'review_text' or 'review' in {combined_path}")
+                            f"Missing required column 'review_text' or 'review' in {dataset_path}")
 
-                # Ensure label column exists
-                if 'label' not in combined_df.columns:
-                    logger.warning(
-                        f"No label column found in {combined_path}. Using all as 'OR' by default.")
-                    combined_df['label'] = 'OR'
+                # Ensure label column exists with better criteria
+                if 'label' not in dataset_df.columns:
+                    if 'review_sentiment' in dataset_df.columns:
+                        # Use clearer thresholds for sentiment-based labeling
+                        # This is still not ideal, but better than using median
+                        dataset_df['review_sentiment'] = dataset_df['review_sentiment'].astype(
+                            float)
+                        # Use fixed thresholds instead of median
+                        dataset_df['label'] = dataset_df['review_sentiment'].apply(
+                            lambda x: 'CG' if x < 0.3 else (
+                                'OR' if x > 0.7 else None)
+                        )
+                        # Remove uncertain labels (those between 0.3 and 0.7)
+                        dataset_df = dataset_df[dataset_df['label'].notna()].copy(
+                        )
+                        logger.info(
+                            f"Created 'label' column using review_sentiment with fixed thresholds. Remaining samples: {len(dataset_df)}")
+                    elif 'ratings' in dataset_df.columns:
+                        # Use a more nuanced approach for ratings
+                        dataset_df['ratings'] = pd.to_numeric(
+                            dataset_df['ratings'], errors='coerce')
+                        # Only use very low (1-2) and very high (4-5) ratings
+                        dataset_df['label'] = dataset_df['ratings'].apply(
+                            lambda x: 'CG' if x <= 2 else (
+                                'OR' if x >= 4 else None)
+                        )
+                        # Remove uncertain labels (3 star ratings)
+                        dataset_df = dataset_df[dataset_df['label'].notna()].copy(
+                        )
+                        logger.info(
+                            f"Created 'label' column using ratings. Remaining samples: {len(dataset_df)}")
+                    else:
+                        logger.error(
+                            "No appropriate column found for labels. Cannot proceed without labels.")
+                        raise ValueError(
+                            "Cannot create labels from available data")
 
             except Exception as e:
-                logger.error(f"Error loading combined dataset: {str(e)}")
+                logger.error(f"Error loading dataset: {str(e)}")
                 raise
 
-            # Process combined data with progress logging
-            logger.info("Processing combined dataset...")
-            combined_df = self._process_dataset(combined_df)
+            # Process dataset with progress logging
+            logger.info("Processing dataset...")
+            dataset_df = self._process_dataset(dataset_df)
             logger.info(
-                f"Combined data processing completed in {time.time() - self.start_time:.2f} seconds")
+                f"Dataset processing completed in {time.time() - self.start_time:.2f} seconds")
             logger.info(
-                f"After processing - combined data size: {len(combined_df)}")
+                f"After processing - dataset size: {len(dataset_df)}")
 
-            # Data augmentation for the minority class
-            logger.info("Performing data augmentation for class balance...")
-            combined_df = self._augment_minority_class(combined_df)
+            # Data augmentation for the minority class - REDUCED to prevent reinforcing patterns
             logger.info(
-                f"After augmentation - combined data size: {len(combined_df)}")
+                "Performing limited data augmentation for class balance...")
+            dataset_df = self._augment_minority_class_reduced(dataset_df)
+            logger.info(
+                f"After augmentation - dataset size: {len(dataset_df)}")
 
             # Split into training and validation with stratification
             logger.info("Splitting data into train and validation sets...")
             train_df, val_df = train_test_split(
-                combined_df,
+                dataset_df,
                 test_size=0.2,
                 random_state=42,
-                stratify=combined_df['label']
+                stratify=dataset_df['label']
             )
 
             # Process features with progress logging
@@ -586,6 +619,64 @@ class DataPreprocessor:
             logger.error(f"Error in preprocessing: {str(e)}")
             raise
 
+    def _augment_minority_class_reduced(self, df):
+        """Reduced augmentation strategy to avoid reinforcing patterns"""
+        # Count classes
+        class_counts = df['label'].value_counts()
+        majority_class = class_counts.idxmax()
+        minority_class = class_counts.idxmin()
+
+        logger.info(
+            f"Class distribution before augmentation: {class_counts.to_dict()}")
+
+        # Extract minority class samples
+        minority_samples = df[df['label'] == minority_class]
+        majority_samples = df[df['label'] == majority_class]
+
+        # Determine how many samples to generate - use at most 50% augmentation
+        n_to_add = min(len(majority_samples) - len(minority_samples),
+                       int(len(minority_samples) * 0.5))
+
+        if n_to_add <= 0:
+            logger.info("No augmentation needed, classes are balanced")
+            return df
+
+        logger.info(
+            f"Augmenting {n_to_add} samples for class '{minority_class}' (reduced strategy)")
+
+        # Simple augmentation technique - only use deletion which is less likely to create artificial patterns
+        augmented_samples = []
+
+        # Sample without replacement where possible to avoid duplicates
+        replace = len(minority_samples) < n_to_add
+        indices = np.random.choice(
+            len(minority_samples), size=n_to_add, replace=replace)
+
+        for idx in indices:
+            sample = minority_samples.iloc[idx].copy()
+            text = sample['text']
+
+            # Only use word deletion, which is less likely to create artificial patterns
+            words = text.split()
+            if len(words) > 10:
+                # Delete fewer words
+                to_delete = np.random.choice(
+                    len(words), size=min(2, len(words)//15), replace=False)
+                sample['text'] = ' '.join(
+                    [w for i, w in enumerate(words) if i not in to_delete])
+                augmented_samples.append(sample)
+
+        # Create DataFrame from augmented samples and combine with original data
+        if augmented_samples:
+            augmented_df = pd.DataFrame(augmented_samples)
+            result_df = pd.concat([df, augmented_df], ignore_index=True)
+        else:
+            result_df = df
+
+        logger.info(
+            f"Class distribution after augmentation: {result_df['label'].value_counts().to_dict()}")
+        return result_df
+
 
 class ReviewClassifier:
     def __init__(self, config_path='config/config.yaml'):
@@ -599,25 +690,23 @@ class ReviewClassifier:
         self.preprocessor = DataPreprocessor(max_features=5000)
 
     def build_model(self, input_shape):
-        # Neural Network Model with stronger regularization
+        # Neural Network Model with much stronger regularization
         inputs = tf.keras.Input(shape=(input_shape,))
 
-        # Add L2 regularization and weight decay
-        regularizer = tf.keras.regularizers.l2(0.001)
+        # Add stronger L2 regularization
+        regularizer = tf.keras.regularizers.l2(
+            0.01)  # Increased from 0.001 to 0.01
 
-        # Simplified architecture with stronger regularization
-        x = Dense(512, activation='relu',
+        # Much simpler architecture to prevent overfitting
+        # Reduced from 512→256→128 to 128→64
+        x = Dense(128, activation='relu',
                   kernel_regularizer=regularizer)(inputs)
         x = BatchNormalization()(x)
-        x = Dropout(0.4)(x)  # Increased dropout
+        x = Dropout(0.5)(x)  # Increased dropout from 0.4 to 0.5
 
-        x = Dense(256, activation='relu', kernel_regularizer=regularizer)(x)
+        x = Dense(64, activation='relu', kernel_regularizer=regularizer)(x)
         x = BatchNormalization()(x)
-        x = Dropout(0.4)(x)  # Increased dropout
-
-        x = Dense(128, activation='relu', kernel_regularizer=regularizer)(x)
-        x = BatchNormalization()(x)
-        x = Dropout(0.3)(x)  # Increased dropout
+        x = Dropout(0.5)(x)  # Increased dropout
 
         # Output layer (1 neuron for binary classification)
         outputs = Dense(1, activation='sigmoid',
@@ -625,10 +714,10 @@ class ReviewClassifier:
 
         model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
-        # Compile model with lower learning rate and weight decay
+        # Compile model with lower learning rate and stronger weight decay
         optimizer = tf.keras.optimizers.Adam(
-            learning_rate=0.0005,  # Lower learning rate
-            weight_decay=1e-5  # Add weight decay
+            learning_rate=0.0002,  # Further reduced from 0.0005
+            weight_decay=1e-4  # Increased from 1e-5
         )
 
         model.compile(
@@ -639,19 +728,22 @@ class ReviewClassifier:
         )
         self.model = model
 
-        # Initialize XGBoost model with early_stopping_rounds in params
+        # Update XGBoost model for better regularization
         self.xgb_model = xgb.XGBClassifier(
-            learning_rate=0.05,  # Reduced learning rate
-            n_estimators=100,    # Fewer estimators
-            max_depth=6,         # Reduced depth to prevent overfitting
-            min_child_weight=2,  # Increased to reduce overfitting
-            gamma=0.1,           # Added gamma to control overfitting
-            subsample=0.7,       # Reduced from 0.8
-            colsample_bytree=0.7,  # Reduced from 0.8
+            learning_rate=0.03,  # Further reduced from 0.05
+            n_estimators=100,
+            max_depth=4,         # Reduced from 6 to prevent overfitting
+            min_child_weight=3,  # Increased from 2
+            gamma=0.2,           # Increased from 0.1
+            subsample=0.6,       # Reduced from 0.7
+            colsample_bytree=0.6,  # Reduced from 0.7
             objective='binary:logistic',
             scale_pos_weight=1,
             tree_method='hist',
-            eval_metric='auc'
+            reg_alpha=0.1,       # Added L1 regularization
+            reg_lambda=1.0,      # Added L2 regularization
+            eval_metric='auc',
+            early_stopping_rounds=10  # Add early stopping as a model parameter
         )
 
         return model
@@ -674,32 +766,32 @@ class ReviewClassifier:
                              for i, count in enumerate(class_count)}
             logger.info(f"Using class weights: {class_weights}")
 
-        # Train neural network with better early stopping
+        # Train neural network with stronger early stopping
         nn_history = self.model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val) if X_val is not None else None,
-            batch_size=32,  # Fixed batch size
-            epochs=50,      # Increased max epochs
+            batch_size=32,
+            epochs=30,      # Reduced from 50 to prevent overfitting
             class_weight=class_weights,
             callbacks=[
                 tf.keras.callbacks.EarlyStopping(
                     monitor='val_loss',
-                    patience=5,    # More aggressive early stopping
+                    # More aggressive early stopping (reduced from 5)
+                    patience=3,
                     restore_best_weights=True,
-                    min_delta=0.001  # Minimum improvement
+                    min_delta=0.001
                 ),
                 tf.keras.callbacks.ReduceLROnPlateau(
                     monitor='val_loss',
-                    factor=0.2,    # More aggressive reduction
-                    patience=3,    # Reduced patience
+                    factor=0.1,    # More aggressive reduction (0.2 → 0.1)
+                    patience=2,    # Reduced patience from 3 to 2
                     min_lr=0.00001
                 )
             ]
         )
 
-        # Train XGBoost model
+        # Train XGBoost model with early stopping
         logger.info("Training XGBoost model...")
-        # Fix for early_stopping_rounds - use eval_metric callback
         eval_set = [(X_val, y_val)] if X_val is not None else None
 
         self.xgb_model.fit(
@@ -708,17 +800,18 @@ class ReviewClassifier:
             verbose=True
         )
 
-        # Create and train a Random Forest with settings to prevent overfitting
+        # Create and train a Random Forest with stronger regularization
         rf_model = RandomForestClassifier(
-            n_estimators=100,     # Reduced from 200
-            max_depth=10,         # Reduced from 20
-            min_samples_split=10,  # Increased from 5
-            min_samples_leaf=4,   # Increased from 2
+            n_estimators=100,
+            max_depth=8,          # Further reduced from 10
+            min_samples_split=15,  # Increased from 10
+            min_samples_leaf=5,    # Increased from 4
             max_features='sqrt',
-            bootstrap=True,       # Added bootstrap sampling
-            oob_score=True,       # Use out-of-bag samples for validation
+            bootstrap=True,
+            oob_score=True,
             n_jobs=-1,
-            class_weight='balanced'
+            class_weight='balanced',
+            max_samples=0.7       # Use bagging with 70% of samples
         )
         rf_model.fit(X_train, y_train)
 
@@ -762,13 +855,44 @@ class ReviewClassifier:
                                rf_weight * rf_pred_proba)
         ensemble_pred = (ensemble_pred_proba > 0.5).astype(int)
 
-        # Find optimal threshold on validation set
-        from sklearn.metrics import roc_curve
-        fpr, tpr, thresholds = roc_curve(y_val, ensemble_pred_proba)
-        # Find the threshold that maximizes TPR - FPR
+        # Find optimal threshold on validation set that prioritizes reducing false positives
+        from sklearn.metrics import roc_curve, precision_recall_curve
+
+        # Get various threshold options
+        fpr, tpr, roc_thresholds = roc_curve(y_val, ensemble_pred_proba)
+        precision, recall, pr_thresholds = precision_recall_curve(
+            y_val, ensemble_pred_proba)
+
+        # Find threshold that maximizes TPR - FPR (balanced accuracy)
         optimal_idx = np.argmax(tpr - fpr)
-        optimal_threshold = thresholds[optimal_idx]
-        logger.info(f"Optimal decision threshold: {optimal_threshold:.3f}")
+        roc_threshold = roc_thresholds[optimal_idx]
+
+        # Find threshold that gives at least 0.95 precision (to reduce false positives)
+        # Note: precision_recall_curve returns precision and recall of length n_thresholds + 1
+        # The thresholds correspond to the precision and recall values at indices 1 to n_thresholds + 1
+        try:
+            # Find indices where precision is at least 0.95
+            high_precision_idx = np.where(precision[:-1] >= 0.95)[0]
+
+            # If we found some high precision points, use the threshold that gives highest recall
+            if len(high_precision_idx) > 0:
+                # Get the index with the highest recall among high-precision points
+                best_idx = high_precision_idx[np.argmax(
+                    recall[high_precision_idx])]
+                pr_threshold = pr_thresholds[best_idx]
+            else:
+                # If no threshold gives 0.95 precision, use a high default
+                pr_threshold = 0.7
+        except Exception as e:
+            logger.warning(
+                f"Could not compute high precision threshold: {str(e)}. Using default 0.7")
+            pr_threshold = 0.7
+
+        # Use the higher of the two thresholds to be more conservative about CG predictions
+        optimal_threshold = max(roc_threshold, pr_threshold)
+        logger.info(f"Balanced accuracy threshold: {roc_threshold:.3f}")
+        logger.info(f"High precision threshold: {pr_threshold:.3f}")
+        logger.info(f"Selected optimal threshold: {optimal_threshold:.3f}")
 
         # Use optimal threshold for final predictions
         ensemble_pred = (ensemble_pred_proba > optimal_threshold).astype(int)
@@ -828,7 +952,7 @@ class ReviewClassifier:
     def predict(self, X):
         """Get predictions using the ensemble model with optimal weights"""
         if not hasattr(self, 'optimal_threshold'):
-            self.optimal_threshold = 0.5
+            self.optimal_threshold = 0.7  # Increased from 0.5 to reduce false positives
             self.model_weights = {'nn': 0.4, 'xgb': 0.4, 'rf': 0.2}
 
         # Get predictions from all models
