@@ -11,7 +11,7 @@ import sys
 import importlib.util
 import subprocess
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_score, recall_score, f1_score
+from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_score, recall_score, f1_score, accuracy_score
 import seaborn as sns
 import xgboost as xgb
 
@@ -133,29 +133,30 @@ def train_model(dataset_path):
                 "No 'label' column found in dataset. Attempting to create labels...")
 
             if 'review_sentiment' in dataset_df.columns:
-                # Use clearer thresholds for sentiment-based labeling
+                # Use wider thresholds for sentiment-based labeling
                 dataset_df['review_sentiment'] = dataset_df['review_sentiment'].astype(
                     float)
-                # Use fixed thresholds instead of median
+                # Widened thresholds to include more data
                 dataset_df['label'] = dataset_df['review_sentiment'].apply(
-                    lambda x: 'CG' if x < 0.3 else ('OR' if x > 0.7 else None)
+                    lambda x: 'CG' if x < 0.4 else ('OR' if x > 0.6 else None)
                 )
-                # Remove uncertain labels (those between 0.3 and 0.7)
+                # Remove uncertain labels (those between 0.4 and 0.6)
                 dataset_df = dataset_df[dataset_df['label'].notna()].copy()
                 logger.info(
-                    f"Created 'label' column using review_sentiment with fixed thresholds. Remaining samples: {len(dataset_df)}")
+                    f"Created 'label' column using review_sentiment with wider thresholds. Remaining samples: {len(dataset_df)}")
             elif 'ratings' in dataset_df.columns:
-                # Use a more nuanced approach for ratings
+                # Use a more inclusive approach for ratings
                 dataset_df['ratings'] = pd.to_numeric(
                     dataset_df['ratings'], errors='coerce')
-                # Only use very low (1-2) and very high (4-5) ratings
+                # Widen criteria to include 3-star reviews
                 dataset_df['label'] = dataset_df['ratings'].apply(
-                    lambda x: 'CG' if x <= 2 else ('OR' if x >= 4 else None)
+                    lambda x: 'CG' if x <= 2.5 else (
+                        'OR' if x >= 3.5 else None)
                 )
-                # Remove uncertain labels (3 star ratings)
+                # Only remove truly uncertain labels
                 dataset_df = dataset_df[dataset_df['label'].notna()].copy()
                 logger.info(
-                    f"Created 'label' column using ratings. Remaining samples: {len(dataset_df)}")
+                    f"Created 'label' column using ratings with wider criteria. Remaining samples: {len(dataset_df)}")
             else:
                 logger.error(
                     "No appropriate column found for creating labels. Cannot proceed.")
@@ -179,6 +180,43 @@ def train_model(dataset_path):
             dataset_df = dataset_df.dropna(subset=['review_text'])
             logger.info(
                 f"After dropping rows with missing reviews: {len(dataset_df)} samples")
+
+        # Separate labeled and unlabeled data
+        labeled_df = dataset_df[dataset_df['label'].notna()].copy()
+        unlabeled_df = dataset_df[dataset_df['label'].isna()].copy()
+
+        logger.info(
+            f"Found {len(labeled_df)} labeled and {len(unlabeled_df)} unlabeled samples")
+
+        # Process unlabeled data with pseudo-labeling if we have enough labeled data
+        if len(labeled_df) >= 300 and len(unlabeled_df) > 0:
+            logger.info("Applying pseudo-labeling to unlabeled data...")
+            # Initialize preprocessor for pseudo-labeling
+            preprocessor = DataPreprocessor(max_features=1000)
+
+            # Process dataset to extract features
+            unlabeled_df = preprocessor._process_dataset(unlabeled_df)
+
+            # Apply pseudo-labeling
+            pseudo_labeled_df = preprocessor._pseudo_label_data(unlabeled_df)
+            logger.info(
+                f"Generated {len(pseudo_labeled_df)} pseudo-labeled samples")
+
+            # Combine with labeled data (if any pseudo-labeled samples were generated)
+            if len(pseudo_labeled_df) > 0:
+                dataset_df = pd.concat(
+                    [labeled_df, pseudo_labeled_df], ignore_index=True)
+                logger.info(
+                    f"Combined dataset now has {len(dataset_df)} samples")
+            else:
+                dataset_df = labeled_df
+                logger.info(
+                    "No reliable pseudo-labels generated, using only labeled data")
+        else:
+            dataset_df = labeled_df
+            if len(unlabeled_df) > 0:
+                logger.info(
+                    "Not enough labeled data for reliable pseudo-labeling, using only labeled data")
 
         # Apply class balancing BEFORE splitting the data
         # Check class distribution
@@ -294,38 +332,69 @@ def train_model(dataset_path):
         # Perform cross-validation for more robust evaluation
         try:
             logger.info(
-                "Performing 5-fold cross-validation for more robust evaluation...")
-            from sklearn.model_selection import cross_val_score, StratifiedKFold
+                "Performing 10-fold stratified cross-validation for robust evaluation...")
+            from sklearn.model_selection import cross_val_score, StratifiedKFold, cross_validate
 
             # Create a pipeline for cross-validation
             X = np.vstack([X_train, X_val])
             y = np.concatenate([y_train, y_val])
 
-            # Create a CV-specific XGBoost model without early stopping
+            # Create a CV-specific XGBoost model with balanced parameters
             cv_xgb_model = xgb.XGBClassifier(
                 learning_rate=0.03,
-                n_estimators=100,
+                n_estimators=120,
                 max_depth=4,
                 min_child_weight=3,
                 gamma=0.2,
-                subsample=0.6,
-                colsample_bytree=0.6,
+                subsample=0.7,
+                colsample_bytree=0.7,
                 objective='binary:logistic',
-                scale_pos_weight=1,
+                scale_pos_weight=1.2,
                 tree_method='hist',
                 reg_alpha=0.1,
                 reg_lambda=1.0,
-                eval_metric='auc'
-                # No early_stopping_rounds for cross-validation
+                eval_metric='auc',
+                random_state=42
             )
 
-            # CV scores for XGBoost (faster than Neural Network)
-            cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-            cv_scores = cross_val_score(
-                cv_xgb_model, X, y, cv=cv, scoring='accuracy')
+            # Define the stratified k-fold with shuffling for stability
+            cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)
+
+            # Use cross_validate to get multiple metrics at once
+            scoring = {
+                'accuracy': 'accuracy',
+                'precision': 'precision',
+                'recall': 'recall',
+                'f1': 'f1',
+                'roc_auc': 'roc_auc',
+                'balanced_accuracy': 'balanced_accuracy'
+            }
+
+            cv_results = cross_validate(
+                cv_xgb_model, X, y, cv=cv, scoring=scoring, return_train_score=False
+            )
+
+            # Calculate and log mean and standard deviation for each metric
+            for metric in scoring.keys():
+                scores = cv_results[f'test_{metric}']
+                logger.info(
+                    f"10-fold CV {metric}: {scores.mean():.4f} ± {scores.std():.4f}")
+
+            # Calculate average ratio of precision to recall to check balance
+            precision_scores = cv_results['test_precision']
+            recall_scores = cv_results['test_recall']
+            pr_ratios = precision_scores / recall_scores
 
             logger.info(
-                f"5-fold Cross-validation accuracy: {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+                f"Average precision/recall ratio: {pr_ratios.mean():.4f}")
+            if pr_ratios.mean() > 1.3:
+                logger.info(
+                    "Note: Precision is significantly higher than recall. Consider adjusting threshold or class weights.")
+            elif pr_ratios.mean() < 0.77:
+                logger.info(
+                    "Note: Recall is significantly higher than precision. Consider adjusting threshold or class weights.")
+            else:
+                logger.info("Precision and recall are reasonably balanced.")
         except Exception as e:
             logger.warning(f"Could not perform cross-validation: {str(e)}")
 
@@ -362,13 +431,14 @@ def plot_training_history(history):
         with open('results/training/history.json', 'w') as f:
             json.dump(history_data, f)
 
-        plt.figure(figsize=(12, 10))
+        plt.figure(figsize=(18, 14))
 
         # Plot accuracy with shaded gap area to highlight overfitting
-        plt.subplot(2, 2, 1)
-        plt.plot(history.history['accuracy'], label='Train', color='blue')
+        plt.subplot(3, 2, 1)
+        plt.plot(history.history['accuracy'],
+                 label='Train', color='blue', linewidth=2)
         plt.plot(history.history['val_accuracy'],
-                 label='Validation', color='orange')
+                 label='Validation', color='orange', linewidth=2, linestyle='-')
 
         # Shade the gap between train and validation (overfitting indicator)
         plt.fill_between(
@@ -378,16 +448,19 @@ def plot_training_history(history):
             alpha=0.2, color='red', label='Overfitting gap'
         )
 
-        plt.title('Model Accuracy (gap indicates overfitting)')
-        plt.ylabel('Accuracy')
-        plt.xlabel('Epoch')
-        plt.legend()
+        plt.title('Model Accuracy (gap indicates overfitting)',
+                  fontsize=14, fontweight='bold')
+        plt.ylabel('Accuracy', fontsize=12)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(fontsize=10)
 
         # Plot loss with shaded area
-        plt.subplot(2, 2, 2)
-        plt.plot(history.history['loss'], label='Train', color='blue')
+        plt.subplot(3, 2, 2)
+        plt.plot(history.history['loss'],
+                 label='Train', color='blue', linewidth=2)
         plt.plot(history.history['val_loss'],
-                 label='Validation', color='orange')
+                 label='Validation', color='orange', linewidth=2, linestyle='-')
 
         # Shade the gap between train and validation loss
         plt.fill_between(
@@ -397,61 +470,130 @@ def plot_training_history(history):
             alpha=0.2, color='red', label='Overfitting gap'
         )
 
-        plt.title('Model Loss (gap indicates overfitting)')
-        plt.ylabel('Loss')
-        plt.xlabel('Epoch')
-        plt.legend()
+        plt.title('Model Loss (gap indicates overfitting)',
+                  fontsize=14, fontweight='bold')
+        plt.ylabel('Loss', fontsize=12)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(fontsize=10)
 
         # Plot precision
-        plt.subplot(2, 2, 3)
-        plt.plot(history.history['precision'], label='Train', color='blue')
+        plt.subplot(3, 2, 3)
+        plt.plot(history.history['precision'],
+                 label='Train', color='blue', linewidth=2)
         plt.plot(history.history['val_precision'],
-                 label='Validation', color='orange')
+                 label='Validation', color='orange', linewidth=2, linestyle='-')
         plt.fill_between(
             range(len(history.history['precision'])),
             history.history['precision'],
             history.history['val_precision'],
             alpha=0.2, color='red'
         )
-        plt.title('Model Precision')
-        plt.ylabel('Precision')
-        plt.xlabel('Epoch')
-        plt.legend()
+        plt.title('Model Precision', fontsize=14, fontweight='bold')
+        plt.ylabel('Precision', fontsize=12)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(fontsize=10)
 
         # Plot recall
-        plt.subplot(2, 2, 4)
-        plt.plot(history.history['recall'], label='Train', color='blue')
+        plt.subplot(3, 2, 4)
+        plt.plot(history.history['recall'],
+                 label='Train', color='blue', linewidth=2)
         plt.plot(history.history['val_recall'],
-                 label='Validation', color='orange')
+                 label='Validation', color='orange', linewidth=2, linestyle='-')
         plt.fill_between(
             range(len(history.history['recall'])),
             history.history['recall'],
             history.history['val_recall'],
             alpha=0.2, color='red'
         )
-        plt.title('Model Recall')
-        plt.ylabel('Recall')
-        plt.xlabel('Epoch')
-        plt.legend()
+        plt.title('Model Recall', fontsize=14, fontweight='bold')
+        plt.ylabel('Recall', fontsize=12)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(fontsize=10)
+
+        # Plot AUC if available
+        if 'auc' in history.history and 'val_auc' in history.history:
+            plt.subplot(3, 2, 5)
+            plt.plot(history.history['auc'],
+                     label='Train', color='blue', linewidth=2)
+            plt.plot(history.history['val_auc'],
+                     label='Validation', color='orange', linewidth=2, linestyle='-')
+            plt.fill_between(
+                range(len(history.history['auc'])),
+                history.history['auc'],
+                history.history['val_auc'],
+                alpha=0.2, color='red'
+            )
+            plt.title('Model AUC', fontsize=14, fontweight='bold')
+            plt.ylabel('AUC', fontsize=12)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.grid(True, linestyle='--', alpha=0.7)
+            plt.legend(fontsize=10)
+
+        # Plot validation metrics together for comparison
+        plt.subplot(3, 2, 6)
+        plt.plot(history.history['val_accuracy'],
+                 label='Accuracy', color='blue', linewidth=2)
+        plt.plot(history.history['val_precision'],
+                 label='Precision', color='green', linewidth=2)
+        plt.plot(history.history['val_recall'],
+                 label='Recall', color='red', linewidth=2)
+        if 'val_auc' in history.history:
+            plt.plot(history.history['val_auc'],
+                     label='AUC', color='purple', linewidth=2)
+        plt.title('Validation Metrics Comparison',
+                  fontsize=14, fontweight='bold')
+        plt.ylabel('Score', fontsize=12)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend(fontsize=10)
 
         plt.tight_layout()
-        plt.savefig('results/training/training_history.png')
+        plt.savefig('results/training/training_history.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
 
-        # Calculate and log the average gap between training and validation
-        acc_gap = np.mean(np.array(history.history['accuracy']) -
-                          np.array(history.history['val_accuracy']))
-        loss_gap = np.mean(np.array(history.history['val_loss']) -
-                           np.array(history.history['loss']))
+        # Create a separate performance over time plot
+        plt.figure(figsize=(10, 6))
+        smoothed_val_acc = np.convolve(
+            history.history['val_accuracy'], np.ones(3)/3, mode='valid')
+        smoothed_val_loss = np.convolve(
+            history.history['val_loss'], np.ones(3)/3, mode='valid')
+        epochs = range(1, len(smoothed_val_acc) + 1)
 
-        logger.info(f"Average accuracy gap (train-val): {acc_gap:.4f} - " +
-                    ("HIGH (overfitting)" if acc_gap > 0.05 else "ACCEPTABLE"))
-        logger.info(f"Average loss gap (val-train): {loss_gap:.4f} - " +
-                    ("HIGH (overfitting)" if loss_gap > 0.1 else "ACCEPTABLE"))
+        ax1 = plt.gca()
+        ax1.plot(epochs, smoothed_val_acc, 'b-',
+                 label='Smoothed Validation Accuracy')
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Accuracy', color='b', fontsize=12)
+        ax1.tick_params(axis='y', labelcolor='b')
+        ax1.set_ylim([0.5, 1.0])
+        ax1.grid(True, linestyle='--', alpha=0.7)
 
-        logger.info(
-            "Training history plot saved to results/training/training_history.png")
+        ax2 = ax1.twinx()
+        ax2.plot(epochs, smoothed_val_loss, 'r-',
+                 label='Smoothed Validation Loss')
+        ax2.set_ylabel('Loss', color='r', fontsize=12)
+        ax2.tick_params(axis='y', labelcolor='r')
+        ax2.set_ylim([0, max(history.history['val_loss'])])
+
+        plt.title('Performance Over Time (Smoothed)',
+                  fontsize=14, fontweight='bold')
+
+        # Add two legends
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+
+        plt.tight_layout()
+        plt.savefig('results/training/performance_over_time.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
     except Exception as e:
-        logger.warning(f"Could not plot training history: {str(e)}")
+        logger.error(f"Error in plotting training history: {str(e)}")
 
 
 def plot_roc_curve(classifier, X_val, y_val):

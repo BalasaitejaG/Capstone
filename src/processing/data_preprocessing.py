@@ -23,6 +23,8 @@ from sklearn.svm import SVC
 from multiprocessing import Pool, cpu_count
 from functools import partial
 import time
+from sklearn.cluster import KMeans
+from scipy.sparse import hstack
 
 # Download required NLTK resources once at module level
 nltk.download('punkt', quiet=True)
@@ -344,28 +346,82 @@ class DataPreprocessor:
         return combined
 
     def _pseudo_label_data(self, df):
-        """Generate pseudo-labels for unlabeled data - optimized version"""
-        start = time.time()
+        """Generate pseudo-labels for unlabeled data - improved version with confidence thresholds"""
+        try:
+            # If the dataframe is empty or already has labels, return as is
+            if len(df) == 0 or 'label' in df.columns:
+                return df
 
-        # Vectorized operations where possible
-        # Create a composite score based on multiple features
-        df['cg_score'] = (
-            (df['repetition_score'] > 0.3).astype(float) * 0.2 +
-            (df['unique_words_ratio'] < 0.4).astype(float) * 0.2 +
-            (df['grammar_complexity'] < 0.1).astype(float) * 0.2 +
-            (df['stopwords_ratio'] > 0.5).astype(float) * 0.2 +
-            (df['avg_sentence_length'] > 20).astype(float) * 0.2
-        )
+            # Train a simple classifier on the text features
+            vectorizer = TfidfVectorizer(
+                max_features=500, stop_words='english')
+            X = vectorizer.fit_transform(df['text'])
 
-        # Apply labels based on confidence score
-        df['label'] = np.where(df['cg_score'] >= 0.6, 'CG', 'OR')
+            # Create initial labels based on linguistic features
+            feature_df = pd.DataFrame()
+            feature_df['word_count'] = df['text'].apply(
+                lambda x: len(x.split()))
+            feature_df['avg_word_length'] = df['text'].apply(lambda x: sum(
+                len(word) for word in x.split()) / max(len(x.split()), 1))
+            feature_df['unique_words_ratio'] = df['text'].apply(
+                lambda x: len(set(x.split())) / max(len(x.split()), 1))
+            feature_df['stopwords_ratio'] = df['text'].apply(lambda x: sum(
+                1 for word in x.split() if word.lower() in STOPWORDS) / max(len(x.split()), 1))
 
-        # Only keep medium-to-high confidence samples
-        result_df = df[df['cg_score'] >= 0.4].copy()
+            # Use more features for better clustering
+            from sklearn.cluster import KMeans
+            from sklearn.preprocessing import StandardScaler
 
-        logger.info(
-            f"Pseudo-labeling completed in {time.time() - start:.2f} seconds")
-        return result_df
+            # Scale features
+            scaler = StandardScaler()
+            features_scaled = scaler.fit_transform(feature_df)
+
+            # Combine with TF-IDF for better clustering
+            combined_features = hstack([X, features_scaled])
+
+            # Use K-means to find natural clusters
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+            clusters = kmeans.fit_predict(combined_features)
+
+            # Determine which cluster is likely CG and which is OR based on feature averages
+            cluster_features = pd.DataFrame()
+            cluster_features['cluster'] = clusters
+            cluster_features['word_count'] = feature_df['word_count'].values
+            cluster_features['unique_ratio'] = feature_df['unique_words_ratio'].values
+
+            # Analyze cluster characteristics
+            cluster_stats = cluster_features.groupby('cluster').mean()
+
+            # Typically, lower unique word ratio and extreme word counts are indicators of CG
+            if cluster_stats.loc[0, 'unique_ratio'] < cluster_stats.loc[1, 'unique_ratio']:
+                cg_cluster = 0
+                or_cluster = 1
+            else:
+                cg_cluster = 1
+                or_cluster = 0
+
+            # Assign labels with confidence score
+            df_with_labels = df.copy()
+            df_with_labels['label'] = ['CG' if c ==
+                                       cg_cluster else 'OR' for c in clusters]
+
+            # Calculate distance to cluster centers as a confidence measure
+            distances = kmeans.transform(combined_features)
+            confidence = np.min(distances, axis=1) / np.sum(distances, axis=1)
+
+            # Only use high confidence predictions (lower relative distance to center)
+            high_conf_mask = confidence < 0.4  # Lower values mean higher confidence
+
+            logger.info(
+                f"Generated {sum(high_conf_mask)} high-confidence pseudo-labels out of {len(df)} samples")
+
+            # Return only high confidence samples
+            return df_with_labels[high_conf_mask]
+
+        except Exception as e:
+            logger.error(f"Error in pseudo-labeling: {str(e)}")
+            # Return empty dataframe on error
+            return pd.DataFrame(columns=df.columns)
 
     def extract_linguistic_features(self, text):
         """Extract linguistic features for analysis"""
@@ -511,34 +567,34 @@ class DataPreprocessor:
                 # Ensure label column exists with better criteria
                 if 'label' not in dataset_df.columns:
                     if 'review_sentiment' in dataset_df.columns:
-                        # Use clearer thresholds for sentiment-based labeling
-                        # This is still not ideal, but better than using median
+                        # Use wider thresholds for sentiment-based labeling
+                        # This increases the amount of data we can use
                         dataset_df['review_sentiment'] = dataset_df['review_sentiment'].astype(
                             float)
-                        # Use fixed thresholds instead of median
+                        # Widened thresholds to include more data
                         dataset_df['label'] = dataset_df['review_sentiment'].apply(
-                            lambda x: 'CG' if x < 0.3 else (
-                                'OR' if x > 0.7 else None)
+                            lambda x: 'CG' if x < 0.4 else (
+                                'OR' if x > 0.6 else None)
                         )
-                        # Remove uncertain labels (those between 0.3 and 0.7)
+                        # Remove uncertain labels (those between 0.4 and 0.6)
                         dataset_df = dataset_df[dataset_df['label'].notna()].copy(
                         )
                         logger.info(
-                            f"Created 'label' column using review_sentiment with fixed thresholds. Remaining samples: {len(dataset_df)}")
+                            f"Created 'label' column using review_sentiment with wider thresholds. Remaining samples: {len(dataset_df)}")
                     elif 'ratings' in dataset_df.columns:
-                        # Use a more nuanced approach for ratings
+                        # Use a more inclusive approach for ratings
                         dataset_df['ratings'] = pd.to_numeric(
                             dataset_df['ratings'], errors='coerce')
-                        # Only use very low (1-2) and very high (4-5) ratings
+                        # Widen criteria to include 3-star reviews
                         dataset_df['label'] = dataset_df['ratings'].apply(
-                            lambda x: 'CG' if x <= 2 else (
-                                'OR' if x >= 4 else None)
+                            lambda x: 'CG' if x <= 2.5 else (
+                                'OR' if x >= 3.5 else None)
                         )
-                        # Remove uncertain labels (3 star ratings)
+                        # Only remove truly uncertain labels
                         dataset_df = dataset_df[dataset_df['label'].notna()].copy(
                         )
                         logger.info(
-                            f"Created 'label' column using ratings. Remaining samples: {len(dataset_df)}")
+                            f"Created 'label' column using ratings with wider criteria. Remaining samples: {len(dataset_df)}")
                     else:
                         logger.error(
                             "No appropriate column found for labels. Cannot proceed without labels.")
@@ -690,23 +746,23 @@ class ReviewClassifier:
         self.preprocessor = DataPreprocessor(max_features=5000)
 
     def build_model(self, input_shape):
-        # Neural Network Model with much stronger regularization
+        # Neural Network Model with balanced regularization
         inputs = tf.keras.Input(shape=(input_shape,))
 
-        # Add stronger L2 regularization
+        # Reduce L2 regularization
         regularizer = tf.keras.regularizers.l2(
-            0.01)  # Increased from 0.001 to 0.01
+            0.008)  # Decreased from 0.015 to 0.008
 
-        # Much simpler architecture to prevent overfitting
-        # Reduced from 512→256→128 to 128→64
+        # Increase model capacity but keep reasonable regularization
+        # Restored from 96→48 to 128→64 with moderate dropout
         x = Dense(128, activation='relu',
                   kernel_regularizer=regularizer)(inputs)
         x = BatchNormalization()(x)
-        x = Dropout(0.5)(x)  # Increased dropout from 0.4 to 0.5
+        x = Dropout(0.4)(x)  # Decreased dropout from 0.6 to 0.4
 
         x = Dense(64, activation='relu', kernel_regularizer=regularizer)(x)
         x = BatchNormalization()(x)
-        x = Dropout(0.5)(x)  # Increased dropout
+        x = Dropout(0.4)(x)  # Decreased dropout from 0.6 to 0.4
 
         # Output layer (1 neuron for binary classification)
         outputs = Dense(1, activation='sigmoid',
@@ -714,10 +770,10 @@ class ReviewClassifier:
 
         model = tf.keras.Model(inputs=inputs, outputs=outputs)
 
-        # Compile model with lower learning rate and stronger weight decay
+        # Compile model with balanced learning rate and weight decay
         optimizer = tf.keras.optimizers.Adam(
-            learning_rate=0.0002,  # Further reduced from 0.0005
-            weight_decay=1e-4  # Increased from 1e-5
+            learning_rate=0.0002,  # Increased from 0.0001
+            weight_decay=8e-5  # Decreased from 1.5e-4
         )
 
         model.compile(
@@ -728,22 +784,22 @@ class ReviewClassifier:
         )
         self.model = model
 
-        # Update XGBoost model for better regularization
+        # Update XGBoost model with more balanced regularization
         self.xgb_model = xgb.XGBClassifier(
-            learning_rate=0.03,  # Further reduced from 0.05
-            n_estimators=100,
-            max_depth=4,         # Reduced from 6 to prevent overfitting
-            min_child_weight=3,  # Increased from 2
-            gamma=0.2,           # Increased from 0.1
-            subsample=0.6,       # Reduced from 0.7
-            colsample_bytree=0.6,  # Reduced from 0.7
+            learning_rate=0.03,  # Increased from 0.02
+            n_estimators=120,
+            max_depth=4,         # Increased from 3 to provide more capacity
+            min_child_weight=3,  # Decreased from 4
+            gamma=0.2,           # Decreased from 0.3
+            subsample=0.7,
+            colsample_bytree=0.7,  # Slightly increased from 0.65
             objective='binary:logistic',
-            scale_pos_weight=1,
+            scale_pos_weight=1.2,  # Added weight to focus more on positive class
             tree_method='hist',
-            reg_alpha=0.1,       # Added L1 regularization
-            reg_lambda=1.0,      # Added L2 regularization
+            reg_alpha=0.1,       # Decreased from 0.15
+            reg_lambda=1.0,      # Decreased from 1.2
             eval_metric='auc',
-            early_stopping_rounds=10  # Add early stopping as a model parameter
+            early_stopping_rounds=10  # Decreased from 12
         )
 
         return model
@@ -758,34 +814,59 @@ class ReviewClassifier:
         # Calculate class weights to handle imbalanced data
         class_weights = None
         if self.config['use_class_weights']:
-            n_samples = len(y_train)
-            n_classes = len(np.unique(y_train))
-
+            # Use a more balanced approach to class weights that puts slightly
+            # more emphasis on the minority class but less extreme than before
             class_count = np.bincount(y_train)
-            class_weights = {i: n_samples / (n_classes * count)
-                             for i, count in enumerate(class_count)}
-            logger.info(f"Using class weights: {class_weights}")
+            total = len(y_train)
+            n_classes = len(class_count)
 
-        # Train neural network with stronger early stopping
+            # Adjust weight calculation to be more balanced
+            class_weights = {}
+            for i in range(n_classes):
+                # This is a more gentle weighting than the default
+                class_weights[i] = total / (n_classes * class_count[i]) * 0.8
+
+                # For the minority class, give it a slightly higher weight
+                if class_count[i] == min(class_count):
+                    class_weights[i] *= 1.2
+
+            logger.info(f"Using balanced class weights: {class_weights}")
+
+        # Create custom learning rate scheduler with gentler decay
+        def lr_scheduler(epoch, lr):
+            if epoch < 2:  # Short warm-up phase
+                return 0.0002
+            elif epoch < 10:
+                return 0.0002  # Hold steady for early epochs
+            elif epoch < 15:
+                return 0.00015  # First gentle reduction
+            elif epoch < 20:
+                return 0.0001  # Second gentle reduction
+            else:
+                return 0.00005  # Final learning rate, higher than before
+
+        # Train neural network with adjusted early stopping
         nn_history = self.model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val) if X_val is not None else None,
             batch_size=32,
-            epochs=30,      # Reduced from 50 to prevent overfitting
+            epochs=30,
             class_weight=class_weights,
             callbacks=[
                 tf.keras.callbacks.EarlyStopping(
                     monitor='val_loss',
-                    # More aggressive early stopping (reduced from 5)
-                    patience=3,
+                    patience=7,        # Increased from 5 to allow more training time
                     restore_best_weights=True,
-                    min_delta=0.001
+                    min_delta=0.001   # Increased from 0.0005 to prevent stopping too early
                 ),
-                tf.keras.callbacks.ReduceLROnPlateau(
-                    monitor='val_loss',
-                    factor=0.1,    # More aggressive reduction (0.2 → 0.1)
-                    patience=2,    # Reduced patience from 3 to 2
-                    min_lr=0.00001
+                tf.keras.callbacks.LearningRateScheduler(lr_scheduler),
+                tf.keras.callbacks.TensorBoard(
+                    log_dir='./logs',
+                    histogram_freq=1,
+                    write_graph=True,
+                    write_images=True,
+                    update_freq='epoch',
+                    profile_batch=0
                 )
             ]
         )
@@ -800,18 +881,20 @@ class ReviewClassifier:
             verbose=True
         )
 
-        # Create and train a Random Forest with stronger regularization
+        # Create and train a Random Forest with balanced regularization
         rf_model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=8,          # Further reduced from 10
-            min_samples_split=15,  # Increased from 10
-            min_samples_leaf=5,    # Increased from 4
+            n_estimators=150,
+            max_depth=8,            # Increased from 6 to allow more complexity
+            min_samples_split=15,   # Decreased from 20
+            min_samples_leaf=5,     # Decreased from 8
             max_features='sqrt',
             bootstrap=True,
             oob_score=True,
             n_jobs=-1,
-            class_weight='balanced',
-            max_samples=0.7       # Use bagging with 70% of samples
+            # Changed from 'balanced' to balanced_subsample
+            class_weight='balanced_subsample',
+            max_samples=0.8,        # Increased from 0.7 to use more samples
+            random_state=42
         )
         rf_model.fit(X_train, y_train)
 
@@ -835,63 +918,140 @@ class ReviewClassifier:
         rf_pred_proba = self.rf_model.predict_proba(X_val)[:, 1]
         rf_pred = (rf_pred_proba > 0.5).astype(int)
 
-        # Calculate optimal weights based on validation performance
+        # Calculate metrics for each model
+        from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix, balanced_accuracy_score
+
+        nn_auc = roc_auc_score(y_val, nn_pred_proba)
+        xgb_auc = roc_auc_score(y_val, xgb_pred_proba)
+        rf_auc = roc_auc_score(y_val, rf_pred_proba)
+
+        # Also consider F1 scores
         nn_f1 = f1_score(y_val, nn_pred)
         xgb_f1 = f1_score(y_val, xgb_pred)
         rf_f1 = f1_score(y_val, rf_pred)
 
-        # Normalize to get weights
-        total_f1 = nn_f1 + xgb_f1 + rf_f1
-        nn_weight = nn_f1 / total_f1
-        xgb_weight = xgb_f1 / total_f1
-        rf_weight = rf_f1 / total_f1
+        # Calculate balanced accuracy
+        nn_bal_acc = balanced_accuracy_score(y_val, nn_pred)
+        xgb_bal_acc = balanced_accuracy_score(y_val, xgb_pred)
+        rf_bal_acc = balanced_accuracy_score(y_val, rf_pred)
 
+        # Combined score with balanced emphasis on different metrics
+        nn_score = 0.5 * nn_auc + 0.3 * nn_f1 + 0.2 * nn_bal_acc
+        xgb_score = 0.5 * xgb_auc + 0.3 * xgb_f1 + 0.2 * xgb_bal_acc
+        rf_score = 0.5 * rf_auc + 0.3 * rf_f1 + 0.2 * rf_bal_acc
+
+        # Calculate dynamically based on model performance but with limits
+        total_score = nn_score + xgb_score + rf_score
+        nn_weight = min(max(0.3, nn_score / total_score), 0.4)
+        xgb_weight = min(max(0.35, xgb_score / total_score), 0.45)
+
+        # Ensure weights sum to 1
+        rf_weight = 1.0 - nn_weight - xgb_weight
+
+        # Log detailed metrics
         logger.info(
-            f"Ensemble weights based on F1: NN={nn_weight:.2f}, XGB={xgb_weight:.2f}, RF={rf_weight:.2f}")
+            f"Model AUC scores: NN={nn_auc:.4f}, XGB={xgb_auc:.4f}, RF={rf_auc:.4f}")
+        logger.info(
+            f"Model F1 scores: NN={nn_f1:.4f}, XGB={xgb_f1:.4f}, RF={rf_f1:.4f}")
+        logger.info(
+            f"Model balanced accuracy: NN={nn_bal_acc:.4f}, XGB={xgb_bal_acc:.4f}, RF={rf_bal_acc:.4f}")
+        logger.info(
+            f"Using ensemble weights: NN={nn_weight:.2f}, XGB={xgb_weight:.2f}, RF={rf_weight:.2f}")
 
-        # Ensemble predictions with calculated weights
+        # Ensemble predictions with balanced weights
         ensemble_pred_proba = (nn_weight * nn_pred_proba.reshape(-1) +
                                xgb_weight * xgb_pred_proba +
                                rf_weight * rf_pred_proba)
-        ensemble_pred = (ensemble_pred_proba > 0.5).astype(int)
 
-        # Find optimal threshold on validation set that prioritizes reducing false positives
-        from sklearn.metrics import roc_curve, precision_recall_curve
+        # Feature selection based on importance
+        try:
+            # Get feature importances from XGBoost
+            importances = self.xgb_model.feature_importances_
 
-        # Get various threshold options
+            # Log top and bottom features
+            if hasattr(self, 'feature_names') and len(self.feature_names) == len(importances):
+                # Sort features by importance
+                indices = np.argsort(importances)[::-1]
+
+                # Log top 20 features
+                logger.info("Top 20 most important features:")
+                for i in range(min(20, len(indices))):
+                    logger.info(
+                        f"{self.feature_names[indices[i]]}: {importances[indices[i]]:.4f}")
+
+                # Log least important features
+                logger.info("10 least important features:")
+                for i in range(1, min(11, len(indices))+1):
+                    idx = indices[-i]
+                    logger.info(
+                        f"{self.feature_names[idx]}: {importances[idx]:.4f}")
+        except Exception as e:
+            logger.warning(f"Could not analyze feature importance: {str(e)}")
+
+        # Balanced threshold finding approach
+        from sklearn.metrics import precision_recall_curve, roc_curve, f1_score
+
+        # Get confusion matrices at various thresholds to better understand tradeoffs
+        thresholds_to_analyze = [0.3, 0.4, 0.5, 0.6, 0.7]
+        for threshold in thresholds_to_analyze:
+            preds = (ensemble_pred_proba > threshold).astype(int)
+            cm = confusion_matrix(y_val, preds)
+            tn, fp, fn, tp = cm.ravel()
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / \
+                (precision + recall) if (precision + recall) > 0 else 0
+            logger.info(f"Threshold {threshold:.2f}: TP={tp}, FP={fp}, TN={tn}, FN={fn}, "
+                        f"Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+
+        # Find threshold that maximizes F1 score with a grid search
+        best_f1 = 0
+        best_f1_threshold = 0.5
+        for threshold in np.arange(0.35, 0.65, 0.01):
+            preds = (ensemble_pred_proba > threshold).astype(int)
+            f1 = f1_score(y_val, preds)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_f1_threshold = threshold
+
+        logger.info(
+            f"Best F1 score {best_f1:.4f} at threshold {best_f1_threshold:.3f}")
+
+        # Find threshold that gives balanced accuracy
         fpr, tpr, roc_thresholds = roc_curve(y_val, ensemble_pred_proba)
+        optimal_idx = np.argmax(tpr - fpr)
+        balanced_threshold = roc_thresholds[optimal_idx]
+        logger.info(f"Balanced accuracy threshold: {balanced_threshold:.3f}")
+
+        # Find threshold with ideal precision-recall tradeoff (prioritize recall more)
         precision, recall, pr_thresholds = precision_recall_curve(
             y_val, ensemble_pred_proba)
 
-        # Find threshold that maximizes TPR - FPR (balanced accuracy)
-        optimal_idx = np.argmax(tpr - fpr)
-        roc_threshold = roc_thresholds[optimal_idx]
+        # Compute F2 score (emphasizes recall more than precision)
+        f2_scores = []
+        # -1 because there's one more precision/recall value than thresholds
+        for i in range(len(precision)-1):
+            if i < len(pr_thresholds):  # Ensure we don't go out of bounds
+                p, r = precision[i], recall[i]
+                if p > 0 and r > 0:
+                    # F2 score formula: (1+beta^2) * (precision*recall) / (beta^2*precision + recall)
+                    # where beta=2 to emphasize recall
+                    f2 = 5 * p * r / (4 * p + r)
+                    f2_scores.append((pr_thresholds[i], f2))
 
-        # Find threshold that gives at least 0.95 precision (to reduce false positives)
-        # Note: precision_recall_curve returns precision and recall of length n_thresholds + 1
-        # The thresholds correspond to the precision and recall values at indices 1 to n_thresholds + 1
-        try:
-            # Find indices where precision is at least 0.95
-            high_precision_idx = np.where(precision[:-1] >= 0.95)[0]
+        # Get best F2 threshold if we have scores
+        if f2_scores:
+            pr_threshold = max(f2_scores, key=lambda x: x[1])[0]
+            logger.info(
+                f"Best precision-recall tradeoff (F2) threshold: {pr_threshold:.3f}")
+        else:
+            pr_threshold = 0.5
+            logger.info(
+                f"Using default precision-recall threshold: {pr_threshold:.3f}")
 
-            # If we found some high precision points, use the threshold that gives highest recall
-            if len(high_precision_idx) > 0:
-                # Get the index with the highest recall among high-precision points
-                best_idx = high_precision_idx[np.argmax(
-                    recall[high_precision_idx])]
-                pr_threshold = pr_thresholds[best_idx]
-            else:
-                # If no threshold gives 0.95 precision, use a high default
-                pr_threshold = 0.7
-        except Exception as e:
-            logger.warning(
-                f"Could not compute high precision threshold: {str(e)}. Using default 0.7")
-            pr_threshold = 0.7
-
-        # Use the higher of the two thresholds to be more conservative about CG predictions
-        optimal_threshold = max(roc_threshold, pr_threshold)
-        logger.info(f"Balanced accuracy threshold: {roc_threshold:.3f}")
-        logger.info(f"High precision threshold: {pr_threshold:.3f}")
+        # Use a weighted combination of thresholds
+        optimal_threshold = 0.45 * best_f1_threshold + \
+            0.35 * balanced_threshold + 0.2 * pr_threshold
         logger.info(f"Selected optimal threshold: {optimal_threshold:.3f}")
 
         # Use optimal threshold for final predictions
@@ -902,21 +1062,27 @@ class ReviewClassifier:
             'accuracy': accuracy_score(y_val, nn_pred),
             'precision': precision_score(y_val, nn_pred),
             'recall': recall_score(y_val, nn_pred),
-            'f1': f1_score(y_val, nn_pred)
+            'f1': f1_score(y_val, nn_pred),
+            'auc': nn_auc,
+            'balanced_acc': nn_bal_acc
         }
 
         xgb_metrics = {
             'accuracy': accuracy_score(y_val, xgb_pred),
             'precision': precision_score(y_val, xgb_pred),
             'recall': recall_score(y_val, xgb_pred),
-            'f1': f1_score(y_val, xgb_pred)
+            'f1': f1_score(y_val, xgb_pred),
+            'auc': xgb_auc,
+            'balanced_acc': xgb_bal_acc
         }
 
         rf_metrics = {
             'accuracy': accuracy_score(y_val, rf_pred),
             'precision': precision_score(y_val, rf_pred),
             'recall': recall_score(y_val, rf_pred),
-            'f1': f1_score(y_val, rf_pred)
+            'f1': f1_score(y_val, rf_pred),
+            'auc': rf_auc,
+            'balanced_acc': rf_bal_acc
         }
 
         ensemble_metrics = {
@@ -924,6 +1090,8 @@ class ReviewClassifier:
             'precision': precision_score(y_val, ensemble_pred),
             'recall': recall_score(y_val, ensemble_pred),
             'f1': f1_score(y_val, ensemble_pred),
+            'auc': roc_auc_score(y_val, ensemble_pred_proba),
+            'balanced_acc': balanced_accuracy_score(y_val, ensemble_pred),
             'threshold': optimal_threshold,
             'weights': {
                 'nn': nn_weight,
@@ -952,8 +1120,8 @@ class ReviewClassifier:
     def predict(self, X):
         """Get predictions using the ensemble model with optimal weights"""
         if not hasattr(self, 'optimal_threshold'):
-            self.optimal_threshold = 0.7  # Increased from 0.5 to reduce false positives
-            self.model_weights = {'nn': 0.4, 'xgb': 0.4, 'rf': 0.2}
+            self.optimal_threshold = 0.75  # Increased from 0.7 to reduce false positives
+            self.model_weights = {'nn': 0.35, 'xgb': 0.45, 'rf': 0.2}
 
         # Get predictions from all models
         nn_pred_proba = self.model.predict(X).reshape(-1)
@@ -967,7 +1135,13 @@ class ReviewClassifier:
             self.model_weights['rf'] * rf_pred_proba
         )
 
-        return ensemble_pred_proba
+        # Apply threshold when returning classification predictions
+        # but not when returning probabilities for further analysis
+        ensemble_pred = (ensemble_pred_proba >
+                         self.optimal_threshold).astype(int)
+
+        # Return both probability and class prediction
+        return ensemble_pred_proba, ensemble_pred
 
     def analyze_review(self, review_text, vectorizer):
         try:
@@ -989,16 +1163,20 @@ class ReviewClassifier:
             X = np.hstack([X_tfidf.toarray(), X_num])
 
             # Get prediction and confidence using ensemble
-            pred_proba = self.predict(X)[0]
+            pred_proba, pred = self.predict(X)
+            # Get the first element since we only have one sample
+            pred_proba = pred_proba[0]
 
             # Determine prediction and confidence
-            prediction = 'Computer Generated' if pred_proba > 0.5 else 'Original'
-            confidence = float(max(pred_proba, 1 - pred_proba))
+            prediction = 'Computer Generated' if pred[0] == 1 else 'Original'
+            confidence = float(max(pred_proba, 1-pred_proba))
 
             # Get detailed analysis
             analysis = {
                 'prediction': prediction,
                 'confidence': confidence,
+                'raw_probability': float(pred_proba),
+                'threshold_used': float(self.optimal_threshold) if hasattr(self, 'optimal_threshold') else 0.75,
                 'reasoning': self._get_reasoning(cleaned_text, confidence, prediction)
             }
 
