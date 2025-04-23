@@ -42,7 +42,7 @@ def scrape_product_reviews(asin):
         "asin": asin,
         "domainCode": "com",
         "sortBy": "recent",
-        "maxPages": 3,  # Get 3 pages of reviews
+        "maxPages": 5,  # Get 5 pages of reviews
         "reviewerType": "all_reviews",
         "formatType": "current_format",
         "mediaType": "all_contents",
@@ -180,7 +180,7 @@ def main():
     print(f"Found {len(asins)} products to scrape")
 
     # Use ThreadPoolExecutor to scrape products concurrently
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(scrape_product_reviews, asins))
 
     # Save all results to a JSON file

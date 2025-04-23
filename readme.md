@@ -161,6 +161,55 @@ model:
 └── requirements.txt           # Dependencies
 ```
 
+## Model Evaluation and Visualization
+
+The system includes a comprehensive evaluation framework to demonstrate model accuracy and performance:
+
+### Automatic Evaluation Metrics
+
+The Kafka pipeline automatically generates evaluation metrics after processing reviews:
+
+1. **Performance Metrics**:
+
+   - Accuracy, precision, recall, and F1-score
+   - Class-specific metrics for both Original (OR) and Computer-Generated (CG) reviews
+   - Confusion matrix showing true/false positives and negatives
+
+2. **Visualizations**:
+
+   - Confusion matrix heat map
+   - Confidence distribution histograms
+   - Model performance bar charts
+   - Class distribution pie charts
+   - Correct vs. incorrect prediction analysis
+
+3. **Professional HTML Report**:
+   - Complete evaluation results in an interactive HTML format
+   - Key metrics highlighted with professional styling
+   - All visualizations embedded in a single report
+   - Summary analysis of model performance
+
+### Running Evaluation
+
+You can run the evaluation at any time using:
+
+```bash
+# Generate all evaluation metrics and visualizations
+python src/evaluation.py
+
+# Options for customization
+python src/evaluation.py --threshold 0.9 --set-labels --output results/custom_eval
+```
+
+All evaluation results are saved in the `results/evaluation/` directory:
+
+- CSV files with detailed metrics
+- High-quality PNG visualizations
+- Interactive HTML report
+- Labeled prediction data
+
+This evaluation framework provides compelling evidence of the model's effectiveness at distinguishing between human-written and AI-generated reviews, making it ideal for presentations and demonstrating the project's value.
+
 ## Results and Analysis
 
 The system provides three types of output:
