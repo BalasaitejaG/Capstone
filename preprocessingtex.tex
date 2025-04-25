@@ -1,0 +1,75 @@
+\subsection{Data Pre-processing}\label{SCM}
+These steps describe our approach to pre-processing the reviews dataset by eliminating missing values, duplications, and unwanted data, creating a purified dataset ready for analysis and model construction.
+
+Data preprocessing steps for our model:
+\begin{enumerate}
+    \item Loading the Data: Our \texttt{preprocess\_dataset()} function loads the dataset using \texttt{pd.read\_csv(dataset\_path)}, either from labeled or combined datasets.
+
+    \item Inspecting Data Columns: We perform validation to verify required columns such as \texttt{'review\_text'} and create surrogate columns where primary columns are absent (e.g., using \texttt{'review'} as \texttt{'review\_text'} when necessary).
+
+    \item Label Engineering: Classification labels are assigned based on either:
+    \begin{itemize}
+        \item Existing labels in the dataset (for labeled data)
+        \item Product ratings if available (converting ratings to binary classes, where \texttt{'CG'} represents computer-generated reviews if rating $\leq$ 2.5, and \texttt{'OR'} represents original/human reviews if rating $\geq$ 3.5)
+        \item For unlabeled data, a three-cluster approach using K-means clustering to identify likely CG vs OR reviews
+    \end{itemize}
+
+    \item Text Cleaning: Review text is processed using the \texttt{\_clean\_text()} method that uses regular expressions to:
+    \begin{itemize}
+        \item Remove URLs and mentions (\texttt{re.sub(r'http\S+|www.\S+', '', text)})
+        \item Lowercase all text (\texttt{text.lower()})
+        \item Strip special characters while retaining basic punctuation (\texttt{re.sub(r'[^\w\s.,!?]', ' ', text)})
+        \item Normalize whitespace (\texttt{re.sub(r'\s+', ' ', text)})
+    \end{itemize}
+
+    \item Feature Extraction: We extract both TF-IDF features and linguistic features:
+    \begin{itemize}
+        \item TF-IDF features using \texttt{TfidfVectorizer} with parameters:
+        \begin{itemize}
+            \item \texttt{max\_features=1000} to limit dimensionality
+            \item \texttt{ngram\_range=(1, 2)} to capture unigrams and bigrams
+            \item \texttt{min\_df=5} to filter out rare terms
+            \item \texttt{max\_df=0.8} to filter out extremely common terms
+        \end{itemize}
+        \item Linguistic features including:
+        \begin{itemize}
+            \item \texttt{length}: Total characters in the text
+            \item \texttt{word\_count}: Number of words
+            \item \texttt{avg\_word\_length}: Average length of words
+            \item \texttt{unique\_words\_ratio}: Ratio of unique words to total words
+            \item \texttt{punctuation\_count}: Amount of punctuation
+            \item \texttt{sentence\_count}: Number of sentences
+            \item \texttt{caps\_ratio}: Ratio of uppercase characters
+            \item \texttt{stopwords\_ratio}: Proportion of stopwords
+            \item \texttt{avg\_sentence\_length}: Average words per sentence
+            \item \texttt{repetition\_score}: Measure of word repetition
+            \item \texttt{grammar\_complexity}: Presence of complex grammatical markers
+        \end{itemize}
+    \end{itemize}
+
+    \item Data Filtering: We employ quality filtering to eliminate poor-quality samples based on linguistic features:
+    \begin{itemize}
+        \item Word count between 5 and 2000
+        \item Ratio of unique words $>$ 0.2
+        \item Proportion of stopwords $<$ 0.7
+        \item Ratio of capitalization $<$ 0.5
+        \item Average sentence length $>$ 2 words
+    \end{itemize}
+
+    \item Class Balancing: For imbalanced datasets, we employ downsampling of the majority class to a maximum of 2:1 ratio, ensuring better model training.
+
+    \item Data Partitioning: The preprocessed dataset is divided using \texttt{train\_test\_split()} with stratification parameters (\texttt{test\_size=0.2}, \texttt{stratify=dataset\_df['label']}) to ensure class balance in train and validation sets.
+
+    \item Feature Vectorization and Combination:
+    \begin{itemize}
+        \item Text is converted to TF-IDF features using \texttt{vectorizer.fit\_transform()} for training data and \texttt{vectorizer.transform()} for validation data
+        \item Numerical linguistic features are scaled with \texttt{StandardScaler}
+        \item Features are combined using \texttt{\_combine\_features()} method and NumPy's \texttt{hstack()} to create a unified feature matrix
+    \end{itemize}
+
+    \item Performance Optimization: For larger datasets (over 1000 reviews), we utilize multiprocessing to parallelize feature extraction, significantly reducing processing time.
+
+    \item Logging and Monitoring: Processing steps are tracked through comprehensive logging, monitoring dataset size, class distribution, feature dimensions, and processing time at each stage.
+\end{enumerate}
+
+This comprehensive preprocessing pipeline ensures that our data is clean, balanced, and optimally prepared for model training, with particular attention to features that help distinguish between computer-generated and human-written reviews. 

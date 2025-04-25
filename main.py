@@ -14,11 +14,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_score, recall_score, f1_score, accuracy_score
 import seaborn as sns
 import xgboost as xgb
+import itertools
 
 # Import custom modules
 from src.processing.data_preprocessing import DataPreprocessor, ReviewClassifier
 from src.kafka.consumer import AdvancedReviewConsumer
 from src.utils.logger import setup_logger
+from src.model_training.ml_models import MLModels
 
 
 def create_required_directories():
@@ -298,6 +300,18 @@ def train_model(dataset_path):
         joblib.dump(classifier.xgb_model, 'models/xgb_model.joblib')
         joblib.dump(classifier.rf_model, 'models/rf_model.joblib')
 
+        # Train additional ML models (SVM, KNN, Logistic Regression, Naive Bayes)
+        logger.info(
+            "Training additional ML models (SVM, KNN, Logistic Regression, Naive Bayes)...")
+        ml_models = MLModels()
+        ml_results = ml_models.train_models(X_train, y_train, X_val, y_val)
+
+        # Plot ML model results including BERT
+        ml_models.plot_all_results(ml_results, X_val, y_val)
+
+        # Plot confusion matrices for all models in a single grid
+        plot_all_model_confusion_matrices(classifier, ml_models, X_val, y_val)
+
         # Plot training history
         plot_training_history(history)
 
@@ -320,12 +334,7 @@ def train_model(dataset_path):
 
         # Create feature importance analysis if possible
         try:
-            feature_names = list(
-                preprocessor.vectorizer.get_feature_names_out())
-            feature_names.extend(['length', 'word_count', 'avg_word_length', 'unique_words_ratio',
-                                 'punctuation_count', 'sentence_count', 'caps_ratio', 'stopwords_ratio',
-                                  'avg_sentence_length', 'repetition_score', 'grammar_complexity'])
-            plot_feature_importance(classifier.xgb_model, feature_names)
+            plot_feature_importance(classifier, X_val)
         except Exception as e:
             logger.warning(f"Could not plot feature importance: {str(e)}")
 
@@ -414,250 +423,301 @@ def train_model(dataset_path):
 
 
 def plot_training_history(history):
-    """Plot training history metrics with improved overfitting visualization"""
-    try:
-        # Save history data to a JSON file for later analysis
-        history_data = {
-            'accuracy': history.history['accuracy'],
-            'val_accuracy': history.history['val_accuracy'],
-            'loss': history.history['loss'],
-            'val_loss': history.history['val_loss'],
-            'precision': history.history['precision'],
-            'val_precision': history.history['val_precision'],
-            'recall': history.history['recall'],
-            'val_recall': history.history['val_recall']
-        }
+    """
+    Plot training history with IEEE paper formatting
 
-        with open('results/training/history.json', 'w') as f:
-            json.dump(history_data, f)
+    Args:
+        history: Training history from model.fit()
+    """
+    # Set up the matplotlib figure with appropriate dimensions for IEEE papers
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-        plt.figure(figsize=(18, 14))
+    # Create epochs array for x-axis
+    epochs = range(1, len(history.history['loss']) + 1)
 
-        # Plot accuracy with shaded gap area to highlight overfitting
-        plt.subplot(3, 2, 1)
-        plt.plot(history.history['accuracy'],
-                 label='Train', color='blue', linewidth=2)
-        plt.plot(history.history['val_accuracy'],
-                 label='Validation', color='orange', linewidth=2, linestyle='-')
+    # Plot loss curves with enhanced styling
+    ax1.plot(epochs, history.history['loss'], 'o-', color='#0072B2', linewidth=2,
+             label='Training Loss', markersize=4)
+    ax1.plot(epochs, history.history['val_loss'], 's-', color='#D55E00', linewidth=2,
+             label='Validation Loss', markersize=4)
 
-        # Shade the gap between train and validation (overfitting indicator)
-        plt.fill_between(
-            range(len(history.history['accuracy'])),
-            history.history['accuracy'],
-            history.history['val_accuracy'],
-            alpha=0.2, color='red', label='Overfitting gap'
-        )
+    # Add IEEE-style formatting to loss plot
+    ax1.set_title('Model Loss', fontsize=14, fontweight='bold', pad=10)
+    ax1.set_xlabel('Epochs', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Loss', fontsize=12, fontweight='bold')
+    ax1.tick_params(axis='both', which='major', labelsize=10)
+    ax1.grid(True, linestyle='--', alpha=0.7)
+    ax1.legend(loc='upper right', fontsize=10, frameon=True,
+               facecolor='white', edgecolor='gray')
 
-        plt.title('Model Accuracy (gap indicates overfitting)',
-                  fontsize=14, fontweight='bold')
-        plt.ylabel('Accuracy', fontsize=12)
-        plt.xlabel('Epoch', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend(fontsize=10)
+    # Find the epoch with minimum validation loss and mark it
+    min_loss_epoch = np.argmin(history.history['val_loss']) + 1
+    min_loss = history.history['val_loss'][min_loss_epoch - 1]
+    ax1.annotate(f'Best: {min_loss:.4f}',
+                 xy=(min_loss_epoch, min_loss),
+                 xytext=(min_loss_epoch + 1, min_loss + 0.05),
+                 arrowprops=dict(facecolor='black', shrink=0.05,
+                                 width=1.5, headwidth=8),
+                 fontsize=10, fontweight='bold')
 
-        # Plot loss with shaded area
-        plt.subplot(3, 2, 2)
-        plt.plot(history.history['loss'],
-                 label='Train', color='blue', linewidth=2)
-        plt.plot(history.history['val_loss'],
-                 label='Validation', color='orange', linewidth=2, linestyle='-')
+    # Plot accuracy curves with enhanced styling
+    ax2.plot(epochs, history.history['accuracy'], 'o-', color='#0072B2', linewidth=2,
+             label='Training Accuracy', markersize=4)
+    ax2.plot(epochs, history.history['val_accuracy'], 's-', color='#D55E00', linewidth=2,
+             label='Validation Accuracy', markersize=4)
 
-        # Shade the gap between train and validation loss
-        plt.fill_between(
-            range(len(history.history['loss'])),
-            history.history['loss'],
-            history.history['val_loss'],
-            alpha=0.2, color='red', label='Overfitting gap'
-        )
+    # Add IEEE-style formatting to accuracy plot
+    ax2.set_title('Model Accuracy', fontsize=14, fontweight='bold', pad=10)
+    ax2.set_xlabel('Epochs', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Accuracy', fontsize=12, fontweight='bold')
+    ax2.tick_params(axis='both', which='major', labelsize=10)
+    ax2.grid(True, linestyle='--', alpha=0.7)
+    ax2.legend(loc='lower right', fontsize=10, frameon=True,
+               facecolor='white', edgecolor='gray')
 
-        plt.title('Model Loss (gap indicates overfitting)',
-                  fontsize=14, fontweight='bold')
-        plt.ylabel('Loss', fontsize=12)
-        plt.xlabel('Epoch', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend(fontsize=10)
+    # Find the epoch with maximum validation accuracy and mark it
+    max_acc_epoch = np.argmax(history.history['val_accuracy']) + 1
+    max_acc = history.history['val_accuracy'][max_acc_epoch - 1]
+    ax2.annotate(f'Best: {max_acc:.4f}',
+                 xy=(max_acc_epoch, max_acc),
+                 xytext=(max_acc_epoch + 1, max_acc - 0.05),
+                 arrowprops=dict(facecolor='black', shrink=0.05,
+                                 width=1.5, headwidth=8),
+                 fontsize=10, fontweight='bold')
 
-        # Plot precision
-        plt.subplot(3, 2, 3)
-        plt.plot(history.history['precision'],
-                 label='Train', color='blue', linewidth=2)
-        plt.plot(history.history['val_precision'],
-                 label='Validation', color='orange', linewidth=2, linestyle='-')
-        plt.fill_between(
-            range(len(history.history['precision'])),
-            history.history['precision'],
-            history.history['val_precision'],
-            alpha=0.2, color='red'
-        )
-        plt.title('Model Precision', fontsize=14, fontweight='bold')
-        plt.ylabel('Precision', fontsize=12)
-        plt.xlabel('Epoch', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend(fontsize=10)
+    # Ensure tight layout to avoid label cutoff
+    plt.tight_layout()
 
-        # Plot recall
-        plt.subplot(3, 2, 4)
-        plt.plot(history.history['recall'],
-                 label='Train', color='blue', linewidth=2)
-        plt.plot(history.history['val_recall'],
-                 label='Validation', color='orange', linewidth=2, linestyle='-')
-        plt.fill_between(
-            range(len(history.history['recall'])),
-            history.history['recall'],
-            history.history['val_recall'],
-            alpha=0.2, color='red'
-        )
-        plt.title('Model Recall', fontsize=14, fontweight='bold')
-        plt.ylabel('Recall', fontsize=12)
-        plt.xlabel('Epoch', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend(fontsize=10)
+    # Save the figure with high resolution for publication quality
+    plt.savefig('results/training/training_history_ieee.png',
+                dpi=300, bbox_inches='tight')
+    plt.close()
 
-        # Plot AUC if available
-        if 'auc' in history.history and 'val_auc' in history.history:
-            plt.subplot(3, 2, 5)
-            plt.plot(history.history['auc'],
-                     label='Train', color='blue', linewidth=2)
-            plt.plot(history.history['val_auc'],
-                     label='Validation', color='orange', linewidth=2, linestyle='-')
-            plt.fill_between(
-                range(len(history.history['auc'])),
-                history.history['auc'],
-                history.history['val_auc'],
-                alpha=0.2, color='red'
-            )
-            plt.title('Model AUC', fontsize=14, fontweight='bold')
-            plt.ylabel('AUC', fontsize=12)
-            plt.xlabel('Epoch', fontsize=12)
-            plt.grid(True, linestyle='--', alpha=0.7)
-            plt.legend(fontsize=10)
+    logger.info(
+        "IEEE-formatted training history plot saved to results/training/training_history_ieee.png")
 
-        # Plot validation metrics together for comparison
-        plt.subplot(3, 2, 6)
-        plt.plot(history.history['val_accuracy'],
-                 label='Accuracy', color='blue', linewidth=2)
-        plt.plot(history.history['val_precision'],
-                 label='Precision', color='green', linewidth=2)
-        plt.plot(history.history['val_recall'],
-                 label='Recall', color='red', linewidth=2)
-        if 'val_auc' in history.history:
-            plt.plot(history.history['val_auc'],
-                     label='AUC', color='purple', linewidth=2)
-        plt.title('Validation Metrics Comparison',
-                  fontsize=14, fontweight='bold')
-        plt.ylabel('Score', fontsize=12)
-        plt.xlabel('Epoch', fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.legend(fontsize=10)
+    # Export training history data to CSV for reference
+    history_df = pd.DataFrame({
+        'epoch': epochs,
+        'train_loss': history.history['loss'],
+        'val_loss': history.history['val_loss'],
+        'train_accuracy': history.history['accuracy'],
+        'val_accuracy': history.history['val_accuracy']
+    })
 
-        plt.tight_layout()
-        plt.savefig('results/training/training_history.png',
-                    dpi=300, bbox_inches='tight')
-        plt.close()
-
-        # Create a separate performance over time plot
-        plt.figure(figsize=(10, 6))
-        smoothed_val_acc = np.convolve(
-            history.history['val_accuracy'], np.ones(3)/3, mode='valid')
-        smoothed_val_loss = np.convolve(
-            history.history['val_loss'], np.ones(3)/3, mode='valid')
-        epochs = range(1, len(smoothed_val_acc) + 1)
-
-        ax1 = plt.gca()
-        ax1.plot(epochs, smoothed_val_acc, 'b-',
-                 label='Smoothed Validation Accuracy')
-        ax1.set_xlabel('Epoch', fontsize=12)
-        ax1.set_ylabel('Accuracy', color='b', fontsize=12)
-        ax1.tick_params(axis='y', labelcolor='b')
-        ax1.set_ylim([0.5, 1.0])
-        ax1.grid(True, linestyle='--', alpha=0.7)
-
-        ax2 = ax1.twinx()
-        ax2.plot(epochs, smoothed_val_loss, 'r-',
-                 label='Smoothed Validation Loss')
-        ax2.set_ylabel('Loss', color='r', fontsize=12)
-        ax2.tick_params(axis='y', labelcolor='r')
-        ax2.set_ylim([0, max(history.history['val_loss'])])
-
-        plt.title('Performance Over Time (Smoothed)',
-                  fontsize=14, fontweight='bold')
-
-        # Add two legends
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='center right')
-
-        plt.tight_layout()
-        plt.savefig('results/training/performance_over_time.png',
-                    dpi=300, bbox_inches='tight')
-        plt.close()
-
-    except Exception as e:
-        logger.error(f"Error in plotting training history: {str(e)}")
+    history_df.to_csv('results/training/training_history.csv', index=False)
+    logger.info(
+        "Training history data saved to results/training/training_history.csv")
 
 
 def plot_roc_curve(classifier, X_val, y_val):
-    """Plot ROC curves for all models"""
+    """Plot ROC curves for all models with IEEE paper formatting"""
     try:
+        # Colorblind-friendly colors
+        colors = [
+            '#1f77b4',  # Blue
+            '#ff7f0e',  # Orange
+            '#2ca02c',  # Green
+            '#d62728',  # Red
+            '#9467bd',  # Purple
+            '#8c564b',  # Brown
+            '#e377c2',  # Pink
+            '#7f7f7f'   # Gray
+        ]
+
+        # Line styles for better distinction
+        line_styles = ['-', '--', '-.', ':', '-', '--', '-.', ':']
+
+        # Markers for better distinction
+        markers = ['o', 's', '^', 'd', '*', 'x', '+', '.']
+
         plt.figure(figsize=(10, 8))
 
         # Neural Network ROC
         y_pred_nn = classifier.model.predict(X_val)
         fpr_nn, tpr_nn, _ = roc_curve(y_val, y_pred_nn)
         roc_auc_nn = auc(fpr_nn, tpr_nn)
-        plt.plot(fpr_nn, tpr_nn,
+        plt.plot(fpr_nn, tpr_nn, color=colors[0], linestyle=line_styles[0],
+                 linewidth=2, marker=markers[0], markevery=0.1, markersize=5,
                  label=f'Neural Network (AUC = {roc_auc_nn:.3f})')
 
         # XGBoost ROC
         y_pred_xgb = classifier.xgb_model.predict_proba(X_val)[:, 1]
         fpr_xgb, tpr_xgb, _ = roc_curve(y_val, y_pred_xgb)
         roc_auc_xgb = auc(fpr_xgb, tpr_xgb)
-        plt.plot(fpr_xgb, tpr_xgb, label=f'XGBoost (AUC = {roc_auc_xgb:.3f})')
+        plt.plot(fpr_xgb, tpr_xgb, color=colors[1], linestyle=line_styles[1],
+                 linewidth=2, marker=markers[1], markevery=0.1, markersize=5,
+                 label=f'XGBoost (AUC = {roc_auc_xgb:.3f})')
 
         # Random Forest ROC
         y_pred_rf = classifier.rf_model.predict_proba(X_val)[:, 1]
         fpr_rf, tpr_rf, _ = roc_curve(y_val, y_pred_rf)
         roc_auc_rf = auc(fpr_rf, tpr_rf)
-        plt.plot(fpr_rf, tpr_rf,
+        plt.plot(fpr_rf, tpr_rf, color=colors[2], linestyle=line_styles[2],
+                 linewidth=2, marker=markers[2], markevery=0.1, markersize=5,
                  label=f'Random Forest (AUC = {roc_auc_rf:.3f})')
 
-        # Plot details
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('Receiver Operating Characteristic (ROC) Curves')
-        plt.legend(loc='lower right')
-        plt.grid(True, alpha=0.3)
+        # Check for additional ML models
+        ml_models_dir = 'models'
+        ml_model_files = [f for f in os.listdir(ml_models_dir) if f.endswith(
+            '_model.joblib') and f not in ['xgb_model.joblib', 'rf_model.joblib']]
 
-        # Save the figure
-        plt.savefig('results/training/roc_curves.png')
-        logger.info("ROC curves saved to results/training/roc_curves.png")
+        for i, model_file in enumerate(ml_model_files):
+            try:
+                model_name = model_file.replace('_model.joblib', '')
+                model = joblib.load(os.path.join(ml_models_dir, model_file))
+
+                # Get predictions and plot ROC curve
+                y_pred_ml = model.predict_proba(X_val)[:, 1]
+                fpr_ml, tpr_ml, _ = roc_curve(y_val, y_pred_ml)
+                roc_auc_ml = auc(fpr_ml, tpr_ml)
+
+                # Convert model name for display (svm -> SVM, knn -> KNN, etc.)
+                display_name = model_name.upper() if model_name in [
+                    'svm', 'knn'] else model_name.replace('_', ' ').title()
+
+                # Prevent index out of range
+                color_idx = min(i + 3, len(colors) - 1)
+                style_idx = min(i + 3, len(line_styles) - 1)
+                marker_idx = min(i + 3, len(markers) - 1)
+
+                plt.plot(fpr_ml, tpr_ml, color=colors[color_idx],
+                         linestyle=line_styles[style_idx], linewidth=2,
+                         marker=markers[marker_idx], markevery=0.1, markersize=5,
+                         label=f'{display_name} (AUC = {roc_auc_ml:.3f})')
+                logger.info(f"Added {display_name} to ROC curve plot")
+            except Exception as e:
+                logger.warning(
+                    f"Could not include {model_file} in ROC plot: {str(e)}")
+
+        # Plot the diagonal line
+        plt.plot([0, 1], [0, 1], 'k--', lw=1.5)
+
+        # Plot details with IEEE formatting
+        plt.xlabel('False Positive Rate', fontsize=14, fontweight='bold')
+        plt.ylabel('True Positive Rate', fontsize=14, fontweight='bold')
+        plt.title('Receiver Operating Characteristic (ROC) Curves',
+                  fontsize=16, fontweight='bold')
+
+        # Move legend to outside of plot for better visibility
+        plt.legend(loc='center left', bbox_to_anchor=(1, 0.5), fontsize=10)
+
+        # Improve grid
+        plt.grid(True, linestyle='--', alpha=0.5)
+
+        # Set precise axis limits
+        plt.xlim([-0.01, 1.01])
+        plt.ylim([-0.01, 1.01])
+
+        # Add annotated points at some key locations for best-performing model
+        # Find best model based on AUC
+        best_auc = max(roc_auc_nn, roc_auc_xgb, roc_auc_rf)
+        if best_auc == roc_auc_nn:
+            best_fpr, best_tpr = fpr_nn, tpr_nn
+            best_name = "Neural Network"
+        elif best_auc == roc_auc_xgb:
+            best_fpr, best_tpr = fpr_xgb, tpr_xgb
+            best_name = "XGBoost"
+        else:
+            best_fpr, best_tpr = fpr_rf, tpr_rf
+            best_name = "Random Forest"
+
+        # Annotate optimal point (closest to top-left corner)
+        dists = (best_fpr ** 2 + (1 - best_tpr) ** 2) ** 0.5
+        optimal_idx = np.argmin(dists)
+
+        plt.scatter(best_fpr[optimal_idx], best_tpr[optimal_idx],
+                    s=100, facecolors='none', edgecolors='black', linewidth=2)
+        plt.annotate(f'Optimal threshold\n({best_fpr[optimal_idx]:.2f}, {best_tpr[optimal_idx]:.2f})',
+                     (best_fpr[optimal_idx], best_tpr[optimal_idx]),
+                     xytext=(best_fpr[optimal_idx]+0.1,
+                             best_tpr[optimal_idx]-0.15),
+                     arrowprops=dict(facecolor='black', shrink=0.05, width=1.5))
+
+        # Add tight layout and save with higher resolution
+        plt.tight_layout()
+        plt.savefig('results/training/roc_curves_ieee.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(
+            "IEEE-formatted ROC curves saved to results/training/roc_curves_ieee.png")
     except Exception as e:
         logger.warning(f"Could not plot ROC curves: {str(e)}")
 
 
-def plot_feature_importance(xgb_model, feature_names, top_n=20):
-    """Plot feature importance from XGBoost model"""
+def plot_feature_importance(classifier, X_val):
+    """Plot feature importance for XGBoost model with IEEE paper formatting"""
     try:
-        # Get feature importances
-        importances = xgb_model.feature_importances_
+        # Get feature importances from XGBoost model
+        feature_importance = classifier.xgb_model.feature_importances_
+        feature_names = X_val.columns
 
-        # Create DataFrame for easier handling
-        features_df = pd.DataFrame({
-            'Feature': feature_names[:len(importances)],
-            'Importance': importances
+        # Sort features by importance
+        indices = np.argsort(feature_importance)[::-1]
+
+        # Keep only top 15 features for better visualization
+        indices = indices[:15]
+
+        # Colorblind-friendly colors for bars
+        colors = plt.cm.viridis(np.linspace(0, 0.8, len(indices)))
+
+        # Create plot with improved styling
+        plt.figure(figsize=(12, 8))
+        plt.title('Feature Importance (XGBoost)',
+                  fontsize=16, fontweight='bold')
+
+        # Create bars with gradient color
+        bars = plt.barh(range(len(indices)), feature_importance[indices], align='center',
+                        color=colors, edgecolor='black', linewidth=1.2)
+
+        # Add value labels to bars
+        for bar in bars:
+            width = bar.get_width()
+            plt.text(width + 0.002, bar.get_y() + bar.get_height()/2,
+                     f'{width:.3f}', ha='left', va='center',
+                     fontweight='bold', fontsize=9)
+
+        # Add feature labels
+        plt.yticks(range(len(indices)), [feature_names[i] for i in indices],
+                   fontsize=12, fontweight='bold')
+
+        # Enhance grid and other elements
+        plt.xlabel('Importance Score', fontsize=14, fontweight='bold')
+        plt.ylabel('Features', fontsize=14, fontweight='bold')
+        plt.grid(axis='x', linestyle='--', alpha=0.6)
+
+        # Add descriptive annotations
+        top_feature = feature_names[indices[0]]
+        top_importance = feature_importance[indices[0]]
+        plt.annotate(f'Most important: {top_feature}\n(Score: {top_importance:.3f})',
+                     xy=(top_importance, 0),
+                     xytext=(top_importance*0.7, -1.5),
+                     arrowprops=dict(facecolor='black',
+                                     shrink=0.05, width=1.5),
+                     fontsize=10, fontweight='bold')
+
+        # Add tight layout to prevent label cutoff
+        plt.tight_layout()
+
+        # Save high-resolution image
+        plt.savefig('results/training/feature_importance_ieee.png',
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(
+            "IEEE-formatted feature importance plot saved to results/training/feature_importance_ieee.png")
+
+        # Create a detailed feature importance table for the report
+        importance_df = pd.DataFrame({
+            'Feature': feature_names,
+            'Importance': feature_importance
         }).sort_values('Importance', ascending=False)
 
-        # Take top N features
-        top_features = features_df.head(top_n)
-
-        # Plot
-        plt.figure(figsize=(12, 8))
-        sns.barplot(x='Importance', y='Feature', data=top_features)
-        plt.title(f'Top {top_n} Feature Importances')
-        plt.tight_layout()
-        plt.savefig('results/training/feature_importance.png')
+        # Save to CSV for reference
+        importance_df.to_csv(
+            'results/training/feature_importance.csv', index=False)
         logger.info(
-            "Feature importance plot saved to results/training/feature_importance.png")
+            "Feature importance data saved to results/training/feature_importance.csv")
+
     except Exception as e:
         logger.warning(f"Could not plot feature importance: {str(e)}")
 
@@ -1088,17 +1148,7 @@ def test_model(test_data_path=None):
             logger.info(f"F1 Score: {f1:.4f}")
 
             # Plot confusion matrix
-            cm = confusion_matrix(y_true, y_pred)
-            plt.figure(figsize=(8, 6))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
-                        xticklabels=['Original', 'Computer Generated'],
-                        yticklabels=['Original', 'Computer Generated'])
-            plt.xlabel('Predicted')
-            plt.ylabel('True')
-            plt.title(f'Confusion Matrix (Accuracy: {accuracy:.4f})')
-            plt.savefig('results/testing/confusion_matrix.png')
-            logger.info(
-                f"Confusion matrix saved to results/testing/confusion_matrix.png")
+            plot_confusion_matrix(y_true, y_pred, ['CG', 'OR'])
 
         return results_df
 
@@ -1375,6 +1425,225 @@ def main():
                 "Dataset analysis complete. Issues were found that need to be addressed.")
             for i, issue in enumerate(issues, 1):
                 logger.error(f"Issue {i}: {issue}")
+
+
+def plot_confusion_matrix(y_true, y_pred, labels):
+    """
+    Plot confusion matrix with IEEE paper formatting
+
+    Args:
+        y_true: True labels
+        y_pred: Predicted labels
+        labels: Label names
+    """
+    # Calculate confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+
+    # Create figure with appropriate size for publication
+    plt.figure(figsize=(10, 8))
+
+    # Use a colorblind-friendly colormap
+    cmap = plt.cm.Blues
+
+    # Plot confusion matrix with enhanced styling
+    im = plt.imshow(cm, interpolation='nearest', cmap=cmap)
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+
+    # Add class labels with improved typography
+    tick_marks = np.arange(len(labels))
+    plt.xticks(tick_marks, labels, rotation=45,
+               ha='right', fontsize=12, fontweight='bold')
+    plt.yticks(tick_marks, labels, fontsize=12, fontweight='bold')
+
+    # Add a title with appropriate formatting
+    plt.title('Confusion Matrix', fontsize=16, fontweight='bold', pad=20)
+    plt.ylabel('True Label', fontsize=14, fontweight='bold')
+    plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
+
+    # Add text annotations to the cells
+    fmt = 'd'
+    thresh = cm.max() / 2.
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        plt.text(j, i, format(cm[i, j], fmt),
+                 horizontalalignment="center",
+                 verticalalignment="center",
+                 color="white" if cm[i, j] > thresh else "black",
+                 fontsize=14, fontweight='bold')
+
+    # Calculate and display metrics on the plot
+    accuracy = np.trace(cm) / np.sum(cm)
+    misclass = 1 - accuracy
+
+    plt.text(cm.shape[1]-0.1, cm.shape[0]+0.3,
+             f'Accuracy: {accuracy:.3f}',
+             horizontalalignment='right',
+             fontsize=12, fontweight='bold')
+
+    plt.text(0.1, cm.shape[0]+0.3,
+             f'Error Rate: {misclass:.3f}',
+             horizontalalignment='left',
+             fontsize=12, fontweight='bold')
+
+    # Ensure tight layout to prevent cutoff
+    plt.tight_layout()
+
+    # Save high resolution image
+    plt.savefig('results/training/confusion_matrix_ieee.png',
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(
+        "IEEE-formatted confusion matrix saved to results/training/confusion_matrix_ieee.png")
+
+    # Calculate additional metrics for reporting
+    precision = precision_score(y_true, y_pred, average='weighted')
+    recall = recall_score(y_true, y_pred, average='weighted')
+    f1 = f1_score(y_true, y_pred, average='weighted')
+
+    # Save metrics to a JSON file for reference
+    metrics = {
+        'accuracy': float(accuracy),
+        'error_rate': float(misclass),
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1_score': float(f1)
+    }
+
+    with open('results/training/classification_metrics.json', 'w') as f:
+        json.dump(metrics, f, indent=4)
+
+    logger.info(
+        "Classification metrics saved to results/training/classification_metrics.json")
+
+
+def plot_all_model_confusion_matrices(classifier, ml_models, X_val, y_val, labels=['CG', 'OR'], save_path='results/training/all_model_confusion_matrices.png'):
+    """
+    Plot confusion matrices for all models (neural network, XGBoost, random forest, and ML models) in a single grid
+
+    Args:
+        classifier: ReviewClassifier instance containing NN, XGBoost, and Random Forest models
+        ml_models: MLModels instance with additional ML models
+        X_val: Validation features
+        y_val: Validation labels  
+        labels: Class labels
+        save_path: Path to save the figure
+    """
+    # Count the number of models
+    n_models = 3 + len(ml_models.models)  # NN, XGB, RF + other ML models
+
+    # Calculate grid dimensions (trying to make it as square as possible)
+    grid_size = int(np.ceil(np.sqrt(n_models)))
+    fig, axes = plt.subplots(grid_size, grid_size,
+                             figsize=(grid_size * 4, grid_size * 4))
+
+    # Flatten axes for easier indexing
+    if grid_size > 1:
+        axes = axes.flatten()
+    else:
+        axes = [axes]
+
+    # Set a global colormap for consistency
+    cmap = plt.cm.Blues
+
+    # Keep track of max value for colorbar normalization
+    max_value = 0
+
+    model_count = 0
+
+    # Neural Network confusion matrix
+    y_pred_nn = (classifier.model.predict(X_val) > 0.5).astype(int).flatten()
+    cm_nn = confusion_matrix(y_val, y_pred_nn)
+    max_value = max(max_value, np.max(cm_nn))
+    sns.heatmap(cm_nn, annot=True, fmt='d', cmap=cmap,
+                ax=axes[model_count], cbar=False)
+    accuracy_nn = np.trace(cm_nn) / np.sum(cm_nn)
+    axes[model_count].set_title(
+        f"Neural Network\nAccuracy: {accuracy_nn:.3f}", fontweight='bold')
+    axes[model_count].set_xlabel('Predicted', fontweight='bold')
+    axes[model_count].set_ylabel('Actual', fontweight='bold')
+    model_count += 1
+
+    # XGBoost confusion matrix
+    y_pred_xgb = (classifier.xgb_model.predict_proba(
+        X_val)[:, 1] > 0.5).astype(int)
+    cm_xgb = confusion_matrix(y_val, y_pred_xgb)
+    max_value = max(max_value, np.max(cm_xgb))
+    sns.heatmap(cm_xgb, annot=True, fmt='d', cmap=cmap,
+                ax=axes[model_count], cbar=False)
+    accuracy_xgb = np.trace(cm_xgb) / np.sum(cm_xgb)
+    axes[model_count].set_title(
+        f"XGBoost\nAccuracy: {accuracy_xgb:.3f}", fontweight='bold')
+    axes[model_count].set_xlabel('Predicted', fontweight='bold')
+    axes[model_count].set_ylabel('Actual', fontweight='bold')
+    model_count += 1
+
+    # Random Forest confusion matrix
+    y_pred_rf = (classifier.rf_model.predict_proba(
+        X_val)[:, 1] > 0.5).astype(int)
+    cm_rf = confusion_matrix(y_val, y_pred_rf)
+    max_value = max(max_value, np.max(cm_rf))
+    sns.heatmap(cm_rf, annot=True, fmt='d', cmap=cmap,
+                ax=axes[model_count], cbar=False)
+    accuracy_rf = np.trace(cm_rf) / np.sum(cm_rf)
+    axes[model_count].set_title(
+        f"Random Forest\nAccuracy: {accuracy_rf:.3f}", fontweight='bold')
+    axes[model_count].set_xlabel('Predicted', fontweight='bold')
+    axes[model_count].set_ylabel('Actual', fontweight='bold')
+    model_count += 1
+
+    # Add confusion matrices for additional ML models
+    for name, model in ml_models.models.items():
+        if model_count < len(axes):
+            ax = axes[model_count]
+
+            # Get predictions
+            y_pred = model.predict(X_val)
+
+            # Calculate confusion matrix
+            cm = confusion_matrix(y_val, y_pred)
+            max_value = max(max_value, np.max(cm))
+
+            # Plot
+            sns.heatmap(cm, annot=True, fmt='d', cmap=cmap, ax=ax, cbar=False)
+
+            # Add accuracy value
+            accuracy = np.trace(cm) / np.sum(cm)
+
+            # Make the title more descriptive with model name and accuracy
+            display_name = name.upper() if name in [
+                'svm', 'knn'] else name.replace('_', ' ').title()
+            ax.set_title(
+                f"{display_name}\nAccuracy: {accuracy:.3f}", fontweight='bold')
+            ax.set_xlabel('Predicted', fontweight='bold')
+            ax.set_ylabel('Actual', fontweight='bold')
+
+            model_count += 1
+
+    # Hide any unused subplots
+    for i in range(model_count, len(axes)):
+        axes[i].axis('off')
+
+    # Add a colorbar to the right of the subplots
+    fig.subplots_adjust(right=0.85, wspace=0.3, hspace=0.3)
+    cbar_ax = fig.add_axes([0.88, 0.15, 0.03, 0.7])
+
+    # Create a ScalarMappable for the colorbar
+    import matplotlib as mpl
+    norm = mpl.colors.Normalize(vmin=0, vmax=max_value)
+    scalar_mappable = mpl.cm.ScalarMappable(cmap=cmap, norm=norm)
+    scalar_mappable.set_array([])
+    fig.colorbar(scalar_mappable, cax=cbar_ax, label='Count')
+
+    # Add a super title
+    plt.suptitle('Confusion Matrices for All Models',
+                 fontsize=20, fontweight='bold', y=0.98)
+
+    # Save the figure
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    logger.info(f"All model confusion matrices saved to {save_path}")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from functools import partial
 import time
 from sklearn.cluster import KMeans
 from scipy.sparse import hstack
+import joblib
 
 # Download required NLTK resources once at module level
 nltk.download('punkt', quiet=True)
@@ -346,8 +347,12 @@ class DataPreprocessor:
         return combined
 
     def _pseudo_label_data(self, df):
-        """Generate pseudo-labels for unlabeled data - improved version with confidence thresholds"""
+        """Generate pseudo-labels for unlabeled data with three-cluster approach as per architecture diagram"""
         try:
+            # Initialize attributes to store cluster models
+            self.cluster_kmeans = None
+            self.cluster_models = {}
+
             # If the dataframe is empty or already has labels, return as is
             if len(df) == 0 or 'label' in df.columns:
                 return df
@@ -367,10 +372,20 @@ class DataPreprocessor:
                 lambda x: len(set(x.split())) / max(len(x.split()), 1))
             feature_df['stopwords_ratio'] = df['text'].apply(lambda x: sum(
                 1 for word in x.split() if word.lower() in STOPWORDS) / max(len(x.split()), 1))
+            # Additional features for better cluster differentiation
+            feature_df['sentence_count'] = df['text'].apply(
+                lambda x: len([s for s in x.split('.') if s.strip()]))
+            feature_df['avg_sentence_length'] = df['text'].apply(
+                lambda x: np.mean([len(s.split()) for s in x.split('.') if s.strip()]) if len([s for s in x.split('.') if s.strip()]) > 0 else 0)
+            feature_df['punctuation_ratio'] = df['text'].apply(
+                lambda x: sum(1 for c in x if c in '.,!?;:') / len(x) if len(x) > 0 else 0)
 
             # Use more features for better clustering
             from sklearn.cluster import KMeans
             from sklearn.preprocessing import StandardScaler
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.ensemble import RandomForestClassifier
+            from xgboost import XGBClassifier
 
             # Scale features
             scaler = StandardScaler()
@@ -379,38 +394,143 @@ class DataPreprocessor:
             # Combine with TF-IDF for better clustering
             combined_features = hstack([X, features_scaled])
 
-            # Use K-means to find natural clusters
-            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+            # Use K-means to find THREE natural clusters as shown in architecture diagram
+            kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
             clusters = kmeans.fit_predict(combined_features)
 
-            # Determine which cluster is likely CG and which is OR based on feature averages
+            # Prepare cluster-specific data
+            cluster_data = {}
+            for cluster_id in range(3):
+                cluster_mask = (clusters == cluster_id)
+                cluster_data[cluster_id] = {
+                    'mask': cluster_mask,
+                    'features': combined_features[cluster_mask],
+                    'df': df[cluster_mask].copy()
+                }
+                logger.info(
+                    f"Cluster {cluster_id} size: {sum(cluster_mask)} samples")
+
+            # Analyze cluster characteristics to determine potential labels
             cluster_features = pd.DataFrame()
             cluster_features['cluster'] = clusters
             cluster_features['word_count'] = feature_df['word_count'].values
             cluster_features['unique_ratio'] = feature_df['unique_words_ratio'].values
+            cluster_features['avg_sentence_length'] = feature_df['avg_sentence_length'].values
 
-            # Analyze cluster characteristics
+            # Analyze cluster statistics
             cluster_stats = cluster_features.groupby('cluster').mean()
+            logger.info(f"Cluster statistics:\n{cluster_stats}")
 
-            # Typically, lower unique word ratio and extreme word counts are indicators of CG
-            if cluster_stats.loc[0, 'unique_ratio'] < cluster_stats.loc[1, 'unique_ratio']:
-                cg_cluster = 0
-                or_cluster = 1
-            else:
-                cg_cluster = 1
-                or_cluster = 0
+            # Determine characteristics of each cluster and assign initial labels
+            # Lower unique word ratio and more extreme metrics likely indicate CG
+            cluster_labels = {}
 
-            # Assign labels with confidence score
-            df_with_labels = df.copy()
-            df_with_labels['label'] = ['CG' if c ==
-                                       cg_cluster else 'OR' for c in clusters]
+            # Sort clusters by unique_ratio (lower is more likely CG)
+            sorted_clusters = cluster_stats.sort_values(
+                'unique_ratio').index.tolist()
 
-            # Calculate distance to cluster centers as a confidence measure
+            # Most likely computer-generated cluster
+            cg_cluster = sorted_clusters[0]
+            # Most likely human-written cluster
+            or_cluster = sorted_clusters[2]
+            # Mixed/uncertain cluster
+            mixed_cluster = sorted_clusters[1]
+
+            # Initialize cluster label mapping
+            cluster_labels = {
+                cg_cluster: 'CG',     # Computer-generated
+                or_cluster: 'OR',     # Original/human-written
+                mixed_cluster: None   # Mixed/uncertain
+            }
+
+            logger.info(
+                f"Identified clusters - CG: {cg_cluster}, OR: {or_cluster}, Mixed: {mixed_cluster}")
+
+            # Train cluster-specific models as shown in architecture diagram
+            cluster_models = {}
+
+            # For each identifiable cluster (CG and OR), train a specialized model
+            for cluster_id in [cg_cluster, or_cluster]:
+                # Only use confidently labeled clusters
+                if cluster_labels[cluster_id]:
+                    # Create synthetic labels based on cluster identity
+                    y_synthetic = np.ones(
+                        sum(cluster_data[cluster_id]['mask']))
+                    if cluster_labels[cluster_id] == 'OR':
+                        y_synthetic = np.zeros(
+                            sum(cluster_data[cluster_id]['mask']))
+
+                    # Train specialized models for this cluster (as per architecture)
+                    models = {
+                        'logistic': LogisticRegression(max_iter=1000, random_state=42),
+                        'rf': RandomForestClassifier(n_estimators=50, random_state=42),
+                        'xgb': XGBClassifier(n_estimators=50, random_state=42)
+                    }
+
+                    # Train each model on this cluster's data
+                    for name, model in models.items():
+                        model.fit(cluster_data[cluster_id]
+                                  ['features'], y_synthetic)
+
+                    # Store trained models
+                    cluster_models[cluster_id] = models
+                    logger.info(
+                        f"Trained specialized models for cluster {cluster_id} ({cluster_labels[cluster_id]})")
+
+            # For mixed/uncertain cluster, use ensemble voting from the other clusters' models
+            # This implements the "final evaluator" shown in the architecture diagram
+            if sum(cluster_data[mixed_cluster]['mask']) > 0:
+                mixed_features = cluster_data[mixed_cluster]['features']
+
+                # Get predictions from both cluster models
+                predictions = []
+                for cluster_id, models in cluster_models.items():
+                    cluster_pred = np.zeros(
+                        sum(cluster_data[mixed_cluster]['mask']))
+                    # Average predictions from all models in this cluster
+                    for name, model in models.items():
+                        if hasattr(model, 'predict_proba'):
+                            cluster_pred += model.predict_proba(
+                                mixed_features)[:, 1]
+                        else:
+                            cluster_pred += model.predict(mixed_features)
+                    cluster_pred /= len(models)
+                    predictions.append(cluster_pred)
+
+                # Average predictions from all cluster models (ensemble/final evaluator)
+                if predictions:
+                    mixed_pred = np.mean(predictions, axis=0)
+                    mixed_labels = (mixed_pred > 0.5).astype(int)
+                    # Assign labels to mixed cluster
+                    cluster_data[mixed_cluster]['df']['label'] = [
+                        'CG' if p == 1 else 'OR' for p in mixed_labels]
+                    logger.info(
+                        f"Assigned labels to mixed cluster: {sum(mixed_labels)} CG, {sum(mixed_labels == 0)} OR")
+
+            # Prepare the final labeled dataset
+            # For CG and OR clusters, directly assign labels
+            for cluster_id in [cg_cluster, or_cluster]:
+                if cluster_labels[cluster_id]:
+                    cluster_data[cluster_id]['df']['label'] = cluster_labels[cluster_id]
+
+            # Combine all clusters
+            df_with_labels = pd.concat([
+                cluster_data[cg_cluster]['df'],
+                cluster_data[or_cluster]['df'],
+                cluster_data[mixed_cluster]['df']
+            ], ignore_index=True)
+
+            # Calculate confidence based on distance to cluster centers
             distances = kmeans.transform(combined_features)
-            confidence = np.min(distances, axis=1) / np.sum(distances, axis=1)
+            confidence = 1 - (np.min(distances, axis=1) /
+                              np.sum(distances, axis=1))
 
-            # Only use high confidence predictions (lower relative distance to center)
-            high_conf_mask = confidence < 0.4  # Lower values mean higher confidence
+            # Only use high confidence predictions
+            high_conf_mask = confidence > 0.6  # Higher values mean higher confidence
+
+            # Store the trained K-means model for future use
+            self.cluster_kmeans = kmeans
+            self.cluster_models = cluster_models
 
             logger.info(
                 f"Generated {sum(high_conf_mask)} high-confidence pseudo-labels out of {len(df)} samples")
@@ -420,6 +540,9 @@ class DataPreprocessor:
 
         except Exception as e:
             logger.error(f"Error in pseudo-labeling: {str(e)}")
+            # Make sure attributes are cleared in case of error
+            self.cluster_kmeans = None
+            self.cluster_models = {}
             # Return empty dataframe on error
             return pd.DataFrame(columns=df.columns)
 
@@ -548,88 +671,107 @@ class DataPreprocessor:
         """Process a dataset that already has labeled and unlabeled data together"""
         try:
             self.start_time = time.time()
-            logger.info("Loading and preprocessing dataset")
+            logger.info(f"Starting preprocessing of {dataset_path}")
 
-            # Load dataset with latin1 encoding
-            try:
-                dataset_df = pd.read_csv(dataset_path, encoding='latin1')
-                logger.info(f"Dataset size: {len(dataset_df)}")
+            # Load dataset
+            df = pd.read_csv(dataset_path)
+            logger.info(f"Loaded {len(df)} rows from dataset")
 
-                # Validate required columns
-                if 'review_text' not in dataset_df.columns:
-                    if 'review' in dataset_df.columns:
-                        dataset_df['review_text'] = dataset_df['review']
-                        logger.info("Using 'review' column as 'review_text'")
-                    else:
-                        raise ValueError(
-                            f"Missing required column 'review_text' or 'review' in {dataset_path}")
+            # Determine the column containing review text
+            text_column = None
+            for col in ['review_text', 'text', 'review']:
+                if col in df.columns:
+                    text_column = col
+                    break
 
-                # Ensure label column exists with better criteria
-                if 'label' not in dataset_df.columns:
-                    if 'review_sentiment' in dataset_df.columns:
-                        # Use wider thresholds for sentiment-based labeling
-                        # This increases the amount of data we can use
-                        dataset_df['review_sentiment'] = dataset_df['review_sentiment'].astype(
-                            float)
-                        # Widened thresholds to include more data
-                        dataset_df['label'] = dataset_df['review_sentiment'].apply(
-                            lambda x: 'CG' if x < 0.4 else (
-                                'OR' if x > 0.6 else None)
-                        )
-                        # Remove uncertain labels (those between 0.4 and 0.6)
-                        dataset_df = dataset_df[dataset_df['label'].notna()].copy(
-                        )
+            if text_column is None:
+                error_msg = f"Could not find text column in dataset. Available columns: {df.columns.tolist()}"
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            logger.info(f"Using column '{text_column}' for review text")
+
+            # Copy text to a standardized column name for further processing
+            df['text'] = df[text_column]
+
+            # Apply preprocessing
+            df = self._process_dataset(df)
+            logger.info(
+                f"After preprocessing: {len(df)} samples remaining")
+
+            # Check for labeled and unlabeled data
+            if 'label' in df.columns:
+                labeled_df = df[df['label'].notna()].copy()
+                unlabeled_df = df[df['label'].isna()].copy()
+                logger.info(
+                    f"Found {len(labeled_df)} labeled and {len(unlabeled_df)} unlabeled samples")
+
+                # Apply pseudo-labeling to unlabeled data if it exists
+                if len(unlabeled_df) > 0:
+                    logger.info(
+                        "Applying cluster-based pseudo-labeling to unlabeled data...")
+                    pseudo_labeled_df = self._pseudo_label_data(unlabeled_df)
+                    logger.info(
+                        f"Generated {len(pseudo_labeled_df)} pseudo-labeled samples")
+
+                    # Combine with labeled data if pseudo-labels were generated
+                    if len(pseudo_labeled_df) > 0:
+                        combined_df = pd.concat(
+                            [labeled_df, pseudo_labeled_df], ignore_index=True)
                         logger.info(
-                            f"Created 'label' column using review_sentiment with wider thresholds. Remaining samples: {len(dataset_df)}")
-                    elif 'ratings' in dataset_df.columns:
-                        # Use a more inclusive approach for ratings
-                        dataset_df['ratings'] = pd.to_numeric(
-                            dataset_df['ratings'], errors='coerce')
-                        # Widen criteria to include 3-star reviews
-                        dataset_df['label'] = dataset_df['ratings'].apply(
-                            lambda x: 'CG' if x <= 2.5 else (
-                                'OR' if x >= 3.5 else None)
-                        )
-                        # Only remove truly uncertain labels
-                        dataset_df = dataset_df[dataset_df['label'].notna()].copy(
-                        )
-                        logger.info(
-                            f"Created 'label' column using ratings with wider criteria. Remaining samples: {len(dataset_df)}")
+                            f"Combined dataset now has {len(combined_df)} samples")
                     else:
-                        logger.error(
-                            "No appropriate column found for labels. Cannot proceed without labels.")
-                        raise ValueError(
-                            "Cannot create labels from available data")
+                        combined_df = labeled_df
+                        logger.info(
+                            "No reliable pseudo-labels generated, using only labeled data")
+                else:
+                    combined_df = labeled_df
+            else:
+                logger.warning("No 'label' column found in dataset")
+                logger.info(
+                    "Applying clustering and pseudo-labeling to all data...")
+                combined_df = self._pseudo_label_data(df)
+                logger.info(f"Generated {len(combined_df)} labeled samples")
 
-            except Exception as e:
-                logger.error(f"Error loading dataset: {str(e)}")
-                raise
+            # Apply class balancing
+            class_counts = combined_df['label'].value_counts()
+            logger.info(f"Class distribution: {class_counts.to_dict()}")
 
-            # Process dataset with progress logging
-            logger.info("Processing dataset...")
-            dataset_df = self._process_dataset(dataset_df)
-            logger.info(
-                f"Dataset processing completed in {time.time() - self.start_time:.2f} seconds")
-            logger.info(
-                f"After processing - dataset size: {len(dataset_df)}")
+            majority_class = class_counts.idxmax()
+            minority_class = class_counts.idxmin()
+            if class_counts[majority_class] > 2 * class_counts[minority_class]:
+                logger.info("Applying class balancing...")
+                majority_samples = combined_df[combined_df['label']
+                                               == majority_class]
+                minority_samples = combined_df[combined_df['label']
+                                               == minority_class]
 
-            # Data augmentation for the minority class - REDUCED to prevent reinforcing patterns
-            logger.info(
-                "Performing limited data augmentation for class balance...")
-            dataset_df = self._augment_minority_class_reduced(dataset_df)
-            logger.info(
-                f"After augmentation - dataset size: {len(dataset_df)}")
+                # Downsample majority class to 2x minority
+                balanced_majority = majority_samples.sample(
+                    n=min(len(minority_samples) * 2, len(majority_samples)),
+                    random_state=42
+                )
 
-            # Split into training and validation with stratification
-            logger.info("Splitting data into train and validation sets...")
+                combined_df = pd.concat(
+                    [balanced_majority, minority_samples], ignore_index=True)
+                logger.info(
+                    f"After balancing: {len(combined_df)} samples, distribution: {combined_df['label'].value_counts().to_dict()}")
+
+            # Split into training and validation sets
             train_df, val_df = train_test_split(
-                dataset_df,
+                combined_df,
                 test_size=0.2,
                 random_state=42,
-                stratify=dataset_df['label']
+                stratify=combined_df['label']
             )
+            logger.info(
+                f"Split into {len(train_df)} training and {len(val_df)} validation samples")
 
-            # Process features with progress logging
+            # Convert labels to integers for training
+            train_df['label_int'] = (train_df['label'] == 'CG').astype(int)
+            val_df['label_int'] = (val_df['label'] == 'CG').astype(int)
+
+            # Generate TF-IDF features
             logger.info("Generating TF-IDF features...")
             start_tfidf = time.time()
             X_train_tfidf = self.vectorizer.fit_transform(train_df['text'])
@@ -664,11 +806,26 @@ class DataPreprocessor:
             X_train = self._combine_features(X_train_tfidf, X_train_num)
             X_val = self._combine_features(X_val_tfidf, X_val_num)
 
-            y_train = (train_df['label'] == 'CG').astype(int)
-            y_val = (val_df['label'] == 'CG').astype(int)
+            y_train = train_df['label_int'].values
+            y_val = val_df['label_int'].values
 
             logger.info(
                 f"All preprocessing completed in {time.time() - self.start_time:.2f} seconds")
+
+            # Store information about any cluster models we created during preprocessing
+            # This allows leveraging them later for prediction
+            if hasattr(self, 'cluster_kmeans') and hasattr(self, 'cluster_models'):
+                logger.info("Using cluster-specific models from preprocessing")
+                # Save models for later use in prediction
+                os.makedirs('models/clusters', exist_ok=True)
+                joblib.dump(self.cluster_kmeans,
+                            'models/clusters/kmeans.joblib')
+                for cluster_id, models in self.cluster_models.items():
+                    for name, model in models.items():
+                        joblib.dump(
+                            model, f'models/clusters/cluster_{cluster_id}_{name}_model.joblib')
+                logger.info("Saved cluster-specific models")
+
             return X_train, X_val, y_train, y_val
 
         except Exception as e:
@@ -1118,11 +1275,130 @@ class ReviewClassifier:
         return ensemble_metrics
 
     def predict(self, X):
-        """Get predictions using the ensemble model with optimal weights"""
+        """Get predictions using the ensemble model with optimal weights, leveraging cluster-specific models if available"""
         if not hasattr(self, 'optimal_threshold'):
             self.optimal_threshold = 0.75  # Increased from 0.7 to reduce false positives
             self.model_weights = {'nn': 0.35, 'xgb': 0.45, 'rf': 0.2}
 
+        # Check if cluster models are available
+        use_cluster_models = False
+        cluster_kmeans = None
+        cluster_models = {}
+
+        # Try to load cluster models if they exist
+        try:
+            if os.path.exists('models/clusters/kmeans.joblib'):
+                cluster_kmeans = joblib.load('models/clusters/kmeans.joblib')
+
+                # Find all cluster model files
+                cluster_files = [f for f in os.listdir(
+                    'models/clusters') if f.startswith('cluster_') and f.endswith('_model.joblib')]
+
+                # Load each cluster model
+                for file in cluster_files:
+                    # Parse file name to get cluster ID and model type
+                    parts = file.replace('_model.joblib', '').split('_')
+                    cluster_id = int(parts[1])
+                    model_type = parts[2]
+
+                    # Initialize dictionary for this cluster if needed
+                    if cluster_id not in cluster_models:
+                        cluster_models[cluster_id] = {}
+
+                    # Load the model
+                    cluster_models[cluster_id][model_type] = joblib.load(
+                        os.path.join('models/clusters', file))
+
+                # Only use cluster models if we found both K-means and at least one model
+                if cluster_models and len(cluster_models) > 0:
+                    use_cluster_models = True
+                    logger.info(
+                        f"Using {len(cluster_models)} cluster-specific models for prediction")
+        except Exception as e:
+            logger.warning(f"Could not load cluster models: {str(e)}")
+            use_cluster_models = False
+
+        # If cluster models are available, use them
+        if use_cluster_models and cluster_kmeans is not None:
+            try:
+                # Assign each sample to its cluster
+                clusters = cluster_kmeans.predict(X)
+
+                # Get predictions from each cluster's models
+                cluster_predictions = np.zeros(len(X))
+
+                # Track which samples were predicted by cluster models
+                cluster_predicted = np.zeros(len(X), dtype=bool)
+
+                # For each cluster
+                for cluster_id, models in cluster_models.items():
+                    # Get samples in this cluster
+                    cluster_mask = (clusters == cluster_id)
+
+                    # Skip if no samples in this cluster
+                    if not np.any(cluster_mask):
+                        continue
+
+                    # Get cluster features
+                    X_cluster = X[cluster_mask]
+
+                    # Get predictions from each model in this cluster
+                    model_predictions = np.zeros(
+                        (sum(cluster_mask), len(models)))
+
+                    # For each model in this cluster
+                    for i, (name, model) in enumerate(models.items()):
+                        # Get predictions
+                        if hasattr(model, 'predict_proba'):
+                            model_predictions[:, i] = model.predict_proba(X_cluster)[
+                                :, 1]
+                        else:
+                            model_predictions[:, i] = model.predict(X_cluster)
+
+                    # Average predictions from all models
+                    avg_predictions = np.mean(model_predictions, axis=1)
+
+                    # Store predictions
+                    cluster_predictions[cluster_mask] = avg_predictions
+                    cluster_predicted[cluster_mask] = True
+
+                # For samples not assigned to any cluster with models, use standard models
+                if not np.all(cluster_predicted):
+                    # Get predictions from neural network
+                    nn_pred_proba = self.model.predict(
+                        X[~cluster_predicted]).reshape(-1)
+
+                    # Get predictions from XGBoost
+                    xgb_pred_proba = self.xgb_model.predict_proba(
+                        X[~cluster_predicted])[:, 1]
+
+                    # Get predictions from Random Forest
+                    rf_pred_proba = self.rf_model.predict_proba(
+                        X[~cluster_predicted])[:, 1]
+
+                    # Apply optimal weights from validation
+                    ensemble_pred_proba = (
+                        self.model_weights['nn'] * nn_pred_proba +
+                        self.model_weights['xgb'] * xgb_pred_proba +
+                        self.model_weights['rf'] * rf_pred_proba
+                    )
+
+                    # Store predictions
+                    cluster_predictions[~cluster_predicted] = ensemble_pred_proba
+
+                # Apply threshold to get final predictions
+                ensemble_pred = (cluster_predictions >
+                                 self.optimal_threshold).astype(int)
+
+                # Return both probability and class prediction
+                return cluster_predictions, ensemble_pred
+
+            except Exception as e:
+                logger.warning(f"Error using cluster models: {str(e)}")
+                # Fall back to standard prediction
+                pass
+
+        # Standard prediction (used if cluster models are not available or failed)
         # Get predictions from all models
         nn_pred_proba = self.model.predict(X).reshape(-1)
         xgb_pred_proba = self.xgb_model.predict_proba(X)[:, 1]
